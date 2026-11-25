@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>originatorVersion</key>
+    <string>rustbrowser_2.0</string>
+    <key>examSessionName</key>
+    <string>Demo SEB Exam</string>
+    <key>startURL</key>
+    <string>https://example.com/</string>
+    <!-- Quit password is "123" (SHA-256 hex) -->
+    <key>hashedQuitPassword</key>
+    <string>a665a45920422f9d417e4867efdc4fb8a04a1f3fff1fa07e998e86f7f7a27ae3</string>
+    <key>allowBrowsingBackForward</key>
+    <false/>
+    <key>browserWindowAllowReload</key>
+    <true/>
+    <key>allowVirtualMachine</key>
+    <false/>
+    <key>allowScreenCapture</key>
+    <false/>
+    <key>allowScreenSharing</key>
+    <false/>
+    <key>allowDownloads</key>
+    <false/>
+    <key>URLFilterRules</key>
+    <array>
+        <dict>
+            <key>active</key>
+            <true/>
+            <key>action</key>
+            <integer>1</integer>
+            <key>expression</key>
+            <string>*.iana.org</string>
+        </dict>
+    </array>
+</dict>
+</plist>

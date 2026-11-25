@@ -1,0 +1,98 @@
+# Example exam configuration for rustbrowser
+# Run in safe dev mode:
+#   cargo run -p rustbrowser -- --config examples/demo-exam.toml --dev
+# Run in full macOS kiosk lockdown mode:
+#   cargo run -p rustbrowser -- --config examples/demo-exam.toml
+
+exam_name = "AP Computer Science — Unit 4 Quiz"
+start_url = "https://example.com/"
+
+# Additional allowed domains (exact host or wildcard subdomain like "*.instructure.com").
+# The start_url host is automatically allowed.
+allowed_domains = [
+    "example.com",
+    "*.iana.org",
+]
+
+# Domains explicitly blocked even if matched by an allowlist wildcard.
+blocked_domains = []
+
+# Generate password/entrance-code hashes with:
+#   cargo run -p rustbrowser -- hash-password "your-code-or-password"
+# Optional entrance code students must enter to begin the exam (omit for immediate start):
+# entrance_code_hash = "sha256$..."
+# Optional teacher quit password (omit to allow students to exit without a password).
+# Demo password below is: "teacher123"
+quit_password_hash = "sha256$a671e2fb006923d09ea231c44e391756$8d6505a3fe926d9d75bda337c2db8d282240fafb25a5d722c633c22a039b3439"
+
+[lockdown]
+kiosk_mode = true
+block_new_windows = true
+block_clipboard = true
+block_context_menu = true
+block_devtools = true
+block_screen_capture = true
+allow_back_forward = false
+allow_reload = true
+allow_insecure_localhost = false
+
+[security]
+# Prefer Apple's AEAssessmentSession (Automatic Assessment Configuration) when entitled,
+# automatically falling back to macOS Kiosk Presentation Mode on unsigned/dev builds.
+prefer_assessment_mode = true
+# Call ptrace(PT_DENY_ATTACH) in non-dev mode to prevent debugger attachment.
+deny_debugger_attach = true
+# Block running inside a VM/hypervisor (Parallels, UTM, VMware, QEMU, etc.).
+block_vm = true
+# Block DYLD_INSERT_LIBRARIES and known runtime hooking/injection libraries.
+block_dylib_injection = true
+# Block multi-monitor / AirPlay / Sidecar setups during an exam.
+block_multiple_displays = true
+# Block running screen-sharing, remote-desktop, or screen-recording tools.
+block_screen_capture_apps = true
+# Refuse to launch the exam if any Critical security finding is detected (ignored in --dev mode).
+fail_closed = true
+# Interval in seconds for continuous in-exam security monitoring (0 disables polling).
+monitor_interval_secs = 3
+
+[browser]
+# Isolate cookies/storage in a private ephemeral exam session (personal logins won't bleed in).
+ephemeral_session = true
+# Prevent saving files to disk during the exam.
+block_downloads = true
+# Allow Cmd+/Cmd-/Cmd+0 page zoom.
+allow_zoom = true
+# Allow Cmd+F Find-in-Page.
+allow_find_in_page = false
+
+[accessibility]
+# Proctor-controlled accommodations (disabled by default for standard exams):
+# Enable built-in Read-Aloud (text-to-speech) for selected text or page content.
+allow_read_aloud = false
+# Default Read-Aloud speaking speed (0.5 to 2.0).
+read_aloud_rate = 1.0
+# Allow macOS Dictation inside Apple Assessment Mode.
+allow_dictation = false
+# Allow macOS Spell Check & Auto-Correction inside Apple Assessment Mode.
+allow_spell_check = false
+# Start with High-Contrast mode enabled (students can also toggle this in the UI).
+high_contrast = false
+# Reduce UI/page animations.
+reduced_motion = false
+# Optional page color tint: "default", "warm", "dark", or "inverted".
+color_tint = "default"
+# Enable the horizontal Line-Focus reading mask/ruler.
+line_focus = false
+# Enable dyslexia-friendly line height and letter/word spacing.
+readable_spacing = false
+
+# Optional live classroom proctor server (omit for 100% local zero-server mode):
+# [proctor]
+# server_url = "http://127.0.0.1:8443"
+# room_code = "AP-CS-Period-2"
+# heartbeat_interval_secs = 5
+
+# Optional teacher-approved pinned tabs (uncomment to test the multi-tab strip):
+[[pinned_tabs]]
+title = "Reference (IANA)"
+url = "https://www.iana.org/help/example-domains"

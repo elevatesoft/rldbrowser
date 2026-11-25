@@ -1,0 +1,691 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>RLD Browser — Exam Config Builder</title>
+<style>
+  :root {
+    --bg-page: #EEF2F7;
+    --bg-chrome: #F4F6F9;
+    --bg-surface: #FFFFFF;
+    --bg-subtle: #F5F7FA;
+    --border: #D7DFE8;
+    --text-primary: #192230;
+    --text-secondary: #4A5566;
+    --text-muted: #8994A4;
+    --accent: #235DBC;
+    --accent-hover: #1D4FA0;
+    --accent-soft: #E4ECFA;
+    --danger: #A62B36;
+    --ok: #1D5250;
+    --ok-soft: #DFEFEB;
+    --font: "SF Pro", -apple-system, BlinkMacSystemFont, "Helvetica Neue", system-ui, sans-serif;
+  }
+
+  * {
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  body {
+    font-family: var(--font);
+    background: var(--bg-page);
+    color: var(--text-primary);
+    line-height: 1.45;
+  }
+
+  .topbar {
+    position: sticky;
+    top: 0;
+    z-index: 20;
+    height: 52px;
+    padding: 0 24px;
+    background: var(--bg-chrome);
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+  .brand {
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+  }
+  .brand h1 {
+    font-size: 15px;
+    font-weight: 590;
+    letter-spacing: -0.01em;
+  }
+  .brand span {
+    font-size: 12px;
+    color: var(--text-secondary);
+  }
+  .pill-local {
+    font-size: 11px;
+    font-weight: 590;
+    padding: 3px 9px;
+    border-radius: 999px;
+    background: var(--ok-soft);
+    color: var(--ok);
+  }
+
+  .layout {
+    max-width: 1180px;
+    margin: 24px auto 48px auto;
+    padding: 0 24px;
+    display: grid;
+    grid-template-columns: minmax(0, 1.35fr) minmax(320px, 0.9fr);
+    gap: 20px;
+    align-items: start;
+  }
+  @media (max-width: 900px) {
+    .layout { grid-template-columns: 1fr; }
+  }
+
+  .card {
+    background: var(--bg-surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    overflow: hidden;
+    margin-bottom: 16px;
+  }
+  .card-header {
+    padding: 13px 18px;
+    background: var(--bg-chrome);
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+  .card-header h2 {
+    font-size: 14px;
+    font-weight: 590;
+    color: var(--text-primary);
+  }
+  .card-header span {
+    font-size: 12px;
+    color: var(--text-secondary);
+  }
+  .card-body {
+    padding: 18px;
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+  }
+
+  .grid-2 {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 12px;
+  }
+  @media (max-width: 640px) {
+    .grid-2 { grid-template-columns: 1fr; }
+  }
+
+  label.field-label {
+    display: block;
+    font-size: 12px;
+    font-weight: 590;
+    color: var(--text-primary);
+    margin-bottom: 5px;
+  }
+  .hint {
+    font-size: 11.5px;
+    color: var(--text-secondary);
+    margin-top: 4px;
+  }
+
+  input[type="text"],
+  input[type="url"],
+  input[type="password"],
+  input[type="number"],
+  select,
+  textarea {
+    width: 100%;
+    padding: 8px 11px;
+    border-radius: 7px;
+    border: 1px solid var(--border);
+    background: var(--bg-surface);
+    color: var(--text-primary);
+    font-family: var(--font);
+    font-size: 13px;
+    outline: none;
+  }
+  input:focus, select:focus, textarea:focus {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 2px rgba(35, 93, 188, 0.16);
+  }
+
+  .toggle-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 4px 0;
+  }
+  .toggle-row .title {
+    font-size: 13px;
+    font-weight: 590;
+    color: var(--text-primary);
+  }
+  .toggle-row .desc {
+    font-size: 11.5px;
+    color: var(--text-secondary);
+  }
+
+  input[type="checkbox"] {
+    width: 17px;
+    height: 17px;
+    accent-color: var(--accent);
+    cursor: pointer;
+    flex-shrink: 0;
+  }
+
+  .pinned-list {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .pinned-row {
+    display: grid;
+    grid-template-columns: 0.85fr 1.4fr auto;
+    gap: 8px;
+    align-items: center;
+  }
+
+  .btn {
+    appearance: none;
+    height: 32px;
+    padding: 0 13px;
+    border-radius: 7px;
+    border: 1px solid var(--border);
+    background: var(--bg-surface);
+    color: var(--text-primary);
+    font-family: var(--font);
+    font-size: 12px;
+    font-weight: 590;
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+  }
+  .btn:hover { background: var(--bg-subtle); }
+  .btn-primary {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: #FFFFFF;
+  }
+  .btn-primary:hover {
+    background: var(--accent-hover);
+    border-color: var(--accent-hover);
+  }
+  .btn-danger-ghost {
+    color: var(--danger);
+    border-color: transparent;
+    background: transparent;
+    padding: 0 8px;
+  }
+  .btn-danger-ghost:hover { background: #FDF2F3; }
+
+  .sticky-col {
+    position: sticky;
+    top: 72px;
+  }
+
+  .output-pre {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 11.5px;
+    line-height: 1.5;
+    background: var(--bg-subtle);
+    border: 1px solid var(--border);
+    border-radius: 7px;
+    padding: 12px;
+    max-height: 360px;
+    overflow: auto;
+    white-space: pre;
+    color: var(--text-primary);
+  }
+
+  .link-box {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 11px;
+    background: var(--bg-subtle);
+    border: 1px solid var(--border);
+    border-radius: 7px;
+    padding: 9px 11px;
+    word-break: break-all;
+    max-height: 84px;
+    overflow: auto;
+    color: var(--text-secondary);
+  }
+
+  .actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+
+  .status {
+    font-size: 12px;
+    font-weight: 510;
+    min-height: 18px;
+    color: var(--ok);
+  }
+  .status.error { color: var(--danger); }
+</style>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <h1>RLD Browser</h1>
+      <span>Teacher Exam Config Builder</span>
+    </div>
+    <span class="pill-local">100% Local · Zero Server</span>
+  </header>
+
+  <main class="layout">
+    <div>
+      <!-- 1. Exam Details -->
+      <section class="card">
+        <div class="card-header">
+          <h2>Exam Details</h2>
+          <span>Required</span>
+        </div>
+        <div class="card-body">
+          <div>
+            <label class="field-label" for="exam-name">Exam Name</label>
+            <input type="text" id="exam-name" value="AP Computer Science — Unit 4 Quiz" />
+          </div>
+          <div>
+            <label class="field-label" for="start-url">Exam Start URL (HTTPS)</label>
+            <input type="url" id="start-url" value="https://canvas.school.edu/courses/101/quizzes/4" />
+            <div class="hint">The start URL's domain is automatically allowed.</div>
+          </div>
+          <div class="grid-2">
+            <div>
+              <label class="field-label" for="allowed-domains">Additional Allowed Domains</label>
+              <textarea id="allowed-domains" rows="3" placeholder="*.instructure.com&#10;accounts.google.com"></textarea>
+              <div class="hint">One domain per line. Supports wildcards like <code>*.school.edu</code>.</div>
+            </div>
+            <div>
+              <label class="field-label" for="blocked-domains">Explicitly Blocked Domains</label>
+              <textarea id="blocked-domains" rows="3" placeholder="chat.school.edu"></textarea>
+              <div class="hint">Overrides allowlist wildcards.</div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- 2. Pinned Reference Materials -->
+      <section class="card">
+        <div class="card-header">
+          <h2>Pinned Reference Materials</h2>
+          <button type="button" class="btn" id="add-pin-btn">+ Add Pinned Tab</button>
+        </div>
+        <div class="card-body">
+          <div class="hint" style="margin-top: 0;">Optional teacher-approved tabs (e.g., Formula Sheet or Desmos Calculator). Leave empty for a single-tab exam.</div>
+          <div class="pinned-list" id="pinned-list"></div>
+        </div>
+      </section>
+
+      <!-- 3. Access & Exit Codes -->
+      <section class="card">
+        <div class="card-header">
+          <h2>Access &amp; Exit Codes</h2>
+          <span>Hashed locally with salted SHA-256</span>
+        </div>
+        <div class="card-body">
+          <div class="grid-2">
+            <div>
+              <label class="field-label" for="entrance-code">Entrance Code (Optional)</label>
+              <input type="password" id="entrance-code" placeholder="Leave blank for immediate start" autocomplete="off" />
+              <div class="hint">Students enter this code after locking in to reveal the exam.</div>
+            </div>
+            <div>
+              <label class="field-label" for="quit-password">Quit Password (Optional)</label>
+              <input type="password" id="quit-password" placeholder="Leave blank to allow free exit" autocomplete="off" />
+              <div class="hint">If blank, students see an "End exam?" confirmation instead.</div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- 4. Lockdown & Anti-Bypass Security -->
+      <section class="card">
+        <div class="card-header">
+          <h2>Lockdown &amp; Security</h2>
+          <span>macOS Assessment Mode + Kiosk</span>
+        </div>
+        <div class="card-body">
+          <div class="toggle-row">
+            <div><div class="title">Fullscreen Lockdown</div><div class="desc">Engage macOS Assessment Mode (or Kiosk fallback), hide Dock &amp; Menu Bar, block Cmd+Tab</div></div>
+            <input type="checkbox" id="kiosk-mode" checked />
+          </div>
+          <div class="toggle-row">
+            <div><div class="title">Block Screenshots &amp; Screen Recording</div><div class="desc">Apply NSWindowSharingNone and block OBS, ScreenSharing, TeamViewer, etc.</div></div>
+            <input type="checkbox" id="block-capture" checked />
+          </div>
+          <div class="toggle-row">
+            <div><div class="title">Block Multiple Displays &amp; Virtual Machines</div><div class="desc">Require a single physical display and native hardware (non-VM)</div></div>
+            <input type="checkbox" id="block-vm-displays" checked />
+          </div>
+          <div class="toggle-row">
+            <div><div class="title">Block Clipboard, Popups &amp; Downloads</div><div class="desc">Clear pasteboard, block new tabs/windows, context menu, DevTools, and file downloads</div></div>
+            <input type="checkbox" id="block-strict" checked />
+          </div>
+          <div class="toggle-row">
+            <div><div class="title">Ephemeral Exam Session</div><div class="desc">Isolate cookies &amp; logins so personal browser sessions do not bleed in</div></div>
+            <input type="checkbox" id="ephemeral-session" checked />
+          </div>
+          <div class="toggle-row">
+            <div><div class="title">Allow Back / Forward Navigation</div><div class="desc">Show Back and Forward buttons in the exam toolbar</div></div>
+            <input type="checkbox" id="allow-back-forward" />
+          </div>
+          <div class="toggle-row">
+            <div><div class="title">Allow Find-in-Page (Cmd+F)</div><div class="desc">Permit searching text on the current exam page</div></div>
+            <input type="checkbox" id="allow-find" />
+          </div>
+        </div>
+      </section>
+
+      <!-- 5. Accessibility Accommodations -->
+      <section class="card">
+        <div class="card-header">
+          <h2>Accessibility Accommodations</h2>
+          <span>IEP / 504 Proctor Controls</span>
+        </div>
+        <div class="card-body">
+          <div class="toggle-row">
+            <div><div class="title">Enable Read Aloud (Text-to-Speech)</div><div class="desc">Show Play/Pause, Stop, and Speed controls in the Accessibility popover</div></div>
+            <input type="checkbox" id="allow-read-aloud" />
+          </div>
+          <div class="toggle-row">
+            <div><div class="title">Allow macOS Dictation</div><div class="desc">Permit speech-to-text inside Apple Assessment Mode</div></div>
+            <input type="checkbox" id="allow-dictation" />
+          </div>
+          <div class="toggle-row">
+            <div><div class="title">Allow Spell Check &amp; Auto-Correction</div><div class="desc">Permit native spell checking inside Apple Assessment Mode</div></div>
+            <input type="checkbox" id="allow-spell-check" />
+          </div>
+          <div class="grid-2">
+            <div>
+              <label class="field-label" for="default-tint">Default Reading Tint</label>
+              <select id="default-tint">
+                <option value="default">Default</option>
+                <option value="warm">Warm</option>
+                <option value="dark">High-Contrast Dark</option>
+              </select>
+            </div>
+            <div>
+              <label class="field-label" for="monitor-interval">Mid-Exam Security Check (sec)</label>
+              <input type="number" id="monitor-interval" min="0" max="60" value="3" />
+            </div>
+          </div>
+        </div>
+      </section>
+    </div>
+
+    <!-- Right Column: Live Export -->
+    <aside class="sticky-col">
+      <section class="card">
+        <div class="card-header">
+          <h2>Export Exam Config</h2>
+          <span id="hash-indicator">Ready</span>
+        </div>
+        <div class="card-body">
+          <div class="actions">
+            <button type="button" class="btn btn-primary" id="download-btn">Download .exam File</button>
+            <button type="button" class="btn" id="copy-link-btn">Copy Launch Link</button>
+            <button type="button" class="btn" id="copy-toml-btn">Copy TOML</button>
+          </div>
+          <div class="status" id="status-msg" role="status" aria-live="polite"></div>
+
+          <div>
+            <label class="field-label">Clickable Launch Link (<code>rld://</code>)</label>
+            <div class="link-box" id="launch-link"></div>
+          </div>
+
+          <div>
+            <label class="field-label">Generated <code>.exam</code> (TOML)</label>
+            <pre class="output-pre" id="toml-preview"></pre>
+          </div>
+        </div>
+      </section>
+    </aside>
+  </main>
+
+<script>
+  const ITERATIONS = 100000;
+  const encoder = new TextEncoder();
+
+  const toHex = (bytes) => Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
+
+  const toBase64Url = (str) => {
+    const bytes = encoder.encode(str);
+    let bin = '';
+    for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+    return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  };
+
+  // Byte-for-byte compatible with crates/core/src/password.rs
+  const hashPassword = async (password) => {
+    const salt = new Uint8Array(16);
+    crypto.getRandomValues(salt);
+    const pwdBytes = encoder.encode(password);
+
+    const concat = (a, b) => {
+      const out = new Uint8Array(a.length + b.length);
+      out.set(a, 0);
+      out.set(b, a.length);
+      return out;
+    };
+
+    let state = new Uint8Array(await crypto.subtle.digest('SHA-256', concat(salt, pwdBytes)));
+    for (let i = 1; i < ITERATIONS; i++) {
+      state = new Uint8Array(await crypto.subtle.digest('SHA-256', concat(salt, state)));
+    }
+    return `sha256$${toHex(salt)}$${toHex(state)}`;
+  };
+
+  const escapeToml = (s) => JSON.stringify(String(s));
+
+  const parseLines = (id) =>
+    document
+      .getElementById(id)
+      .value.split('\n')
+      .map((l) => l.trim())
+      .filter(Boolean);
+
+  const pinnedListEl = document.getElementById('pinned-list');
+  const addPinnedRow = (title = '', url = '') => {
+    const row = document.createElement('div');
+    row.className = 'pinned-row';
+    row.innerHTML = `
+      <input type="text" class="pin-title" placeholder="Tab title (e.g., Formula Sheet)" />
+      <input type="url" class="pin-url" placeholder="https://..." />
+      <button type="button" class="btn btn-danger-ghost" aria-label="Remove pinned tab">Remove</button>
+    `;
+    row.querySelector('.pin-title').value = title;
+    row.querySelector('.pin-url').value = url;
+    row.querySelector('button').addEventListener('click', () => {
+      row.remove();
+      scheduleRender();
+    });
+    row.querySelectorAll('input').forEach((inp) => inp.addEventListener('input', scheduleRender));
+    pinnedListEl.appendChild(row);
+  };
+
+  document.getElementById('add-pin-btn').addEventListener('click', () => {
+    addPinnedRow('', '');
+    scheduleRender();
+  });
+
+  // Cache password hashes per plaintext so editing other fields stays instant
+  const hashCache = new Map();
+  let renderSeq = 0;
+  let lastToml = '';
+  let lastLink = '';
+
+  const getCachedHash = async (raw) => {
+    if (!raw) return null;
+    if (hashCache.has(raw)) return hashCache.get(raw);
+    const h = await hashPassword(raw);
+    hashCache.set(raw, h);
+    return h;
+  };
+
+  const setStatus = (msg, isError = false) => {
+    const el = document.getElementById('status-msg');
+    el.textContent = msg;
+    el.classList.toggle('error', isError);
+  };
+
+  const buildToml = async () => {
+    const seq = ++renderSeq;
+    const indicator = document.getElementById('hash-indicator');
+    indicator.textContent = 'Updating...';
+
+    const examName = document.getElementById('exam-name').value.trim() || 'Locked Exam Session';
+    const startUrl = document.getElementById('start-url').value.trim();
+    const allowed = parseLines('allowed-domains');
+    const blocked = parseLines('blocked-domains');
+    const entranceRaw = document.getElementById('entrance-code').value;
+    const quitRaw = document.getElementById('quit-password').value;
+
+    const entranceHash = await getCachedHash(entranceRaw);
+    const quitHash = await getCachedHash(quitRaw);
+    if (seq !== renderSeq) return;
+
+    const kiosk = document.getElementById('kiosk-mode').checked;
+    const blockCapture = document.getElementById('block-capture').checked;
+    const blockVmDisplays = document.getElementById('block-vm-displays').checked;
+    const blockStrict = document.getElementById('block-strict').checked;
+    const ephemeral = document.getElementById('ephemeral-session').checked;
+    const allowBackForward = document.getElementById('allow-back-forward').checked;
+    const allowFind = document.getElementById('allow-find').checked;
+    const allowReadAloud = document.getElementById('allow-read-aloud').checked;
+    const allowDictation = document.getElementById('allow-dictation').checked;
+    const allowSpell = document.getElementById('allow-spell-check').checked;
+    const tint = document.getElementById('default-tint').value;
+    const interval = Math.max(0, Math.min(60, Number(document.getElementById('monitor-interval').value) || 0));
+
+    const lines = [
+      `exam_name = ${escapeToml(examName)}`,
+      `start_url = ${escapeToml(startUrl)}`,
+      `allowed_domains = [${allowed.map(escapeToml).join(', ')}]`,
+      `blocked_domains = [${blocked.map(escapeToml).join(', ')}]`,
+    ];
+    if (entranceHash) lines.push(`entrance_code_hash = ${escapeToml(entranceHash)}`);
+    if (quitHash) lines.push(`quit_password_hash = ${escapeToml(quitHash)}`);
+
+    lines.push(
+      '',
+      '[lockdown]',
+      `kiosk_mode = ${kiosk}`,
+      `block_new_windows = ${blockStrict}`,
+      `block_clipboard = ${blockStrict}`,
+      `block_context_menu = ${blockStrict}`,
+      `block_devtools = ${blockStrict}`,
+      `block_screen_capture = ${blockCapture}`,
+      `allow_back_forward = ${allowBackForward}`,
+      `allow_reload = true`,
+      `allow_insecure_localhost = false`,
+      '',
+      '[security]',
+      `prefer_assessment_mode = true`,
+      `deny_debugger_attach = true`,
+      `block_vm = ${blockVmDisplays}`,
+      `block_dylib_injection = true`,
+      `block_multiple_displays = ${blockVmDisplays}`,
+      `block_screen_capture_apps = ${blockCapture}`,
+      `fail_closed = true`,
+      `monitor_interval_secs = ${interval}`,
+      '',
+      '[browser]',
+      `ephemeral_session = ${ephemeral}`,
+      `block_downloads = ${blockStrict}`,
+      `allow_zoom = true`,
+      `allow_find_in_page = ${allowFind}`,
+      '',
+      '[accessibility]',
+      `allow_read_aloud = ${allowReadAloud}`,
+      `read_aloud_rate = 1.0`,
+      `allow_dictation = ${allowDictation}`,
+      `allow_spell_check = ${allowSpell}`,
+      `high_contrast = false`,
+      `reduced_motion = false`,
+      `color_tint = ${escapeToml(tint)}`,
+      `line_focus = false`,
+      `readable_spacing = false`
+    );
+
+    const pins = Array.from(pinnedListEl.querySelectorAll('.pinned-row'))
+      .map((row) => ({
+        title: row.querySelector('.pin-title').value.trim(),
+        url: row.querySelector('.pin-url').value.trim(),
+      }))
+      .filter((p) => p.title && p.url);
+
+    for (const pin of pins) {
+      lines.push('', '[[pinned_tabs]]', `title = ${escapeToml(pin.title)}`, `url = ${escapeToml(pin.url)}`);
+    }
+
+    lastToml = lines.join('\n') + '\n';
+    lastLink = `rld://config?data=${toBase64Url(lastToml)}`;
+
+    document.getElementById('toml-preview').textContent = lastToml;
+    document.getElementById('launch-link').textContent = lastLink;
+    indicator.textContent = startUrl.startsWith('https://') ? 'Valid HTTPS' : 'Check start_url';
+  };
+
+  let debounceTimer = null;
+  const scheduleRender = () => {
+    clearTimeout(debounceTimer);
+    debounceTimer = setTimeout(buildToml, 150);
+  };
+
+  document.querySelectorAll('input, textarea, select').forEach((el) => {
+    el.addEventListener('input', scheduleRender);
+    el.addEventListener('change', scheduleRender);
+  });
+
+  document.getElementById('download-btn').addEventListener('click', () => {
+    const slug = (document.getElementById('exam-name').value.trim() || 'exam')
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, '-')
+      .replace(/^-|-$/g, '');
+    const blob = new Blob([lastToml], { type: 'text/plain;charset=utf-8' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `${slug || 'exam'}.exam`;
+    a.click();
+    URL.revokeObjectURL(a.href);
+    setStatus(`Downloaded ${slug || 'exam'}.exam`);
+  });
+
+  document.getElementById('copy-link-btn').addEventListener('click', async () => {
+    try {
+      await navigator.clipboard.writeText(lastLink);
+      setStatus('Copied rld:// launch link to clipboard.');
+    } catch {
+      setStatus('Could not access clipboard — copy the link manually.', true);
+    }
+  });
+
+  document.getElementById('copy-toml-btn').addEventListener('click', async () => {
+    try {
+      await navigator.clipboard.writeText(lastToml);
+      setStatus('Copied .exam TOML to clipboard.');
+    } catch {
+      setStatus('Could not access clipboard — copy the TOML manually.', true);
+    }
+  });
+
+  buildToml();
+</script>
+</body>
+</html>
