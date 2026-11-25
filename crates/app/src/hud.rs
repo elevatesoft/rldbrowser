@@ -75,12 +75,7 @@ pub fn build_hud_html_with_options(
         ""
     };
 
-    let dev_badge = match (dev_mode, enable_webcam) {
-        (true, true) => r#"<span class="dev-pill">DEV</span><span class="cam-pill">CAM</span>"#,
-        (true, false) => r#"<span class="dev-pill">DEV</span>"#,
-        (false, true) => r#"<span class="cam-pill">CAM</span>"#,
-        (false, false) => "",
-    };
+    let version = env!("CARGO_PKG_VERSION");
 
     let read_aloud_section = if allow_read_aloud {
         r#"<div class="pop-divider"></div>
@@ -160,6 +155,7 @@ pub fn build_hud_html_with_options(
     --switch-off: #C7D0DE;
     --backdrop: rgba(51, 66, 86, 0.15);
     --font: "SF Pro", -apple-system, BlinkMacSystemFont, "Helvetica Neue", system-ui, sans-serif;
+    --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, monospace;
   }}
 
   * {{
@@ -226,24 +222,17 @@ pub fn build_hud_html_with_options(
     overflow: hidden;
     text-overflow: ellipsis;
   }}
-  .dev-pill {{
-    font-size: 10px;
-    font-weight: 600;
-    padding: 1px 5px;
-    border-radius: 4px;
-    background: #FEF3C7;
-    color: #92400E;
-    border: 1px solid #FDE68A;
-    flex-shrink: 0;
-  }}
-  .cam-pill {{
-    font-size: 10px;
-    font-weight: 600;
-    padding: 1px 5px;
-    border-radius: 4px;
-    background: #DFEFEB;
-    color: #1D5250;
-    border: 1px solid #B6DAD2;
+  .ver-pill {{
+    font-family: var(--mono);
+    font-size: 10.5px;
+    font-weight: 500;
+    line-height: 14px;
+    color: var(--text-muted);
+    background: rgba(25, 34, 48, 0.05);
+    border: 1px solid var(--border);
+    border-radius: 5px;
+    padding: 1px 6px;
+    letter-spacing: 0.01em;
     flex-shrink: 0;
   }}
   .host {{
@@ -949,7 +938,7 @@ pub fn build_hud_html_with_options(
       <div class="left">
         <div class="title-row">
           <span class="title">{exam_name}</span>
-          {dev_badge}
+          <span class="ver-pill" title="RLD Browser version">v{version}</span>
         </div>
         <span class="host" id="host">{initial_host}</span>
       </div>
@@ -1961,5 +1950,23 @@ mod tests {
         assert!(html.contains(r#"id="security-teacher-quit""#));
         assert!(html.contains("securityTeacherQuitBtn.style.display = canExit ? 'none' : 'inline-block'"));
         assert!(html.contains("!DEV_MODE && (e.metaKey || e.ctrlKey) && ['q', 'h', 'w', 'm', 'n', 't', 'r', 'p', 's', 'o', 'l'].includes(key)"));
+    }
+
+    #[test]
+    fn build_hud_html_renders_version_pill_without_dev_or_cam_pills() {
+        let mut cfg = sample_config();
+        cfg.proctor.enable_webcam = true;
+        cfg.proctor.server_url = Some(Url::parse("https://proctor.example.edu").unwrap());
+
+        let html = build_hud_html(&cfg, true, false);
+        let expected_pill = format!(
+            r#"<span class="ver-pill" title="RLD Browser version">v{}</span>"#,
+            env!("CARGO_PKG_VERSION")
+        );
+        assert!(html.contains(&expected_pill));
+        assert!(!html.contains("dev-pill"));
+        assert!(!html.contains("cam-pill"));
+        assert!(html.contains("const DEV_MODE = true;"));
+        assert!(html.contains("const ENABLE_WEBCAM = true;"));
     }
 }

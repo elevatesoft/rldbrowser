@@ -200,8 +200,10 @@ pub fn dashboard_html() -> &'static str {
   }
   .rail-btn:hover { background: var(--bg-hover); }
   .rail-btn.danger {
+    background: #FDF6F6;
     color: var(--danger);
-    border-color: rgba(166, 43, 54, 0.28);
+    border-color: rgba(166, 43, 54, 0.34);
+    transition: background 100ms ease, border-color 100ms ease, color 100ms ease;
   }
   .rail-btn.danger:hover {
     background: var(--danger);
@@ -459,15 +461,20 @@ pub fn dashboard_html() -> &'static str {
     height: 26px;
     padding: 0 10px;
     border-radius: 6px;
-    border: 1px solid var(--border-strong);
-    background: var(--bg-canvas);
-    color: var(--text-secondary);
+    border: 1px solid rgba(166, 43, 54, 0.32);
+    background: #FDF6F6;
+    color: var(--danger);
     font-family: var(--font);
     font-size: 11.5px;
     font-weight: 500;
     cursor: pointer;
+    transition: background 100ms ease, border-color 100ms ease, color 100ms ease;
   }
-  .row-action:hover { color: var(--text-primary); border-color: rgba(25, 34, 48, 0.3); }
+  .row-action:hover {
+    background: var(--danger);
+    border-color: var(--danger);
+    color: #FFFFFF;
+  }
 
   /* Right Inspector Pane (320px, opens on student click) */
   .inspector {
@@ -916,10 +923,252 @@ pub fn dashboard_html() -> &'static str {
     cursor: pointer;
   }
   .btn-danger-solid:hover { background: var(--danger-hover); }
+
+  /* Teacher Sign-In / Create Account View (Quiet Native 396px card) */
+  .auth-view {
+    display: none;
+    position: fixed;
+    inset: 0;
+    background: #F6F7F9;
+    align-items: center;
+    justify-content: center;
+    padding: 24px;
+    z-index: 40;
+  }
+  .auth-view.open { display: flex; }
+  .auth-card {
+    width: 100%;
+    max-width: 396px;
+    background: #FFFFFF;
+    border: 1px solid var(--border-strong);
+    border-radius: 12px;
+    box-shadow: 0 10px 30px rgba(25, 34, 48, 0.06);
+    padding: 28px 28px 24px 28px;
+    display: flex;
+    flex-direction: column;
+    gap: 18px;
+  }
+  .auth-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+  }
+  .auth-brand {
+    font-size: 16px;
+    font-weight: 600;
+    color: var(--text-primary);
+    letter-spacing: -0.01em;
+  }
+  .auth-badge {
+    font-size: 11px;
+    font-weight: 500;
+    color: var(--text-secondary);
+    background: var(--bg-rail);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 3px 8px;
+  }
+  .auth-seg {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    padding: 2px;
+    background: var(--bg-rail);
+    border: 1px solid var(--border-strong);
+    border-radius: 8px;
+  }
+  .auth-seg button {
+    appearance: none;
+    height: 28px;
+    border: 1px solid transparent;
+    border-radius: 6px;
+    background: transparent;
+    color: var(--text-secondary);
+    font-family: var(--font);
+    font-size: 12px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: background 120ms ease, color 120ms ease;
+  }
+  .auth-seg button.active {
+    background: var(--bg-canvas);
+    border-color: var(--border);
+    color: var(--text-primary);
+  }
+  .auth-form {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+  }
+  .auth-field {
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+  }
+  .auth-label {
+    font-size: 12px;
+    font-weight: 500;
+    color: var(--text-secondary);
+  }
+  .auth-input-row {
+    display: flex;
+    gap: 6px;
+  }
+  .auth-input {
+    width: 100%;
+    height: 34px;
+    padding: 0 10px;
+    border-radius: 7px;
+    border: 1px solid var(--border-strong);
+    background: var(--bg-canvas);
+    color: var(--text-primary);
+    font-family: var(--font);
+    font-size: 13px;
+    outline: none;
+  }
+  .auth-input:focus { border-color: var(--accent); }
+  .auth-error {
+    display: none;
+    font-size: 12px;
+    line-height: 17px;
+    color: var(--danger);
+    background: var(--bg-row-flag);
+    border: 1px solid rgba(166, 43, 54, 0.25);
+    border-radius: 7px;
+    padding: 8px 10px;
+  }
+  .auth-error.show { display: block; }
+  .auth-submit {
+    appearance: none;
+    width: 100%;
+    height: 36px;
+    margin-top: 2px;
+    border-radius: 8px;
+    border: 1px solid var(--accent);
+    background: var(--accent);
+    color: #FFFFFF;
+    font-family: var(--font);
+    font-size: 13px;
+    font-weight: 500;
+    cursor: pointer;
+  }
+  .auth-submit:hover { opacity: 0.93; }
+  .auth-submit:disabled { opacity: 0.6; cursor: default; }
+
+  /* Teacher account summary in rail footer */
+  .rail-account {
+    padding: 4px 4px 8px 4px;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 4px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+  }
+  .rail-account-meta {
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+  }
+  .rail-account-name {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text-primary);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .rail-account-email {
+    font-size: 11px;
+    color: var(--text-muted);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .rail-signout {
+    appearance: none;
+    height: 24px;
+    padding: 0 8px;
+    border-radius: 5px;
+    border: 1px solid var(--border-strong);
+    background: var(--bg-canvas);
+    color: var(--text-secondary);
+    font-family: var(--font);
+    font-size: 11px;
+    font-weight: 500;
+    cursor: pointer;
+    flex-shrink: 0;
+  }
+  .rail-signout:hover { color: var(--text-primary); background: var(--bg-hover); }
+
+  /* Exam Rooms View */
+  .rooms-bar {
+    padding: 12px 20px;
+    background: var(--bg-rail);
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .rooms-err {
+    font-size: 12px;
+    color: var(--danger);
+    padding: 8px 20px 0 20px;
+  }
+  .room-actions {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    justify-content: flex-end;
+  }
+  .row-action.primary {
+    border-color: var(--accent);
+    background: var(--accent);
+    color: #FFFFFF;
+  }
+  .row-action.primary:hover { opacity: 0.92; color: #FFFFFF; }
+  .row-action.danger:hover {
+    color: var(--danger);
+    border-color: rgba(166, 43, 54, 0.35);
+    background: var(--bg-row-flag);
+  }
 </style>
 </head>
 <body>
-  <div class="shell">
+  <div class="auth-view" id="auth-view" aria-label="Teacher sign in">
+    <div class="auth-card">
+      <div class="auth-head">
+        <div class="auth-brand">RLD Proctor</div>
+        <span class="auth-badge">Teacher Console</span>
+      </div>
+      <div class="auth-seg" role="tablist" aria-label="Authentication mode">
+        <button type="button" id="auth-tab-login" class="active" role="tab" aria-selected="true">Sign in</button>
+        <button type="button" id="auth-tab-register" role="tab" aria-selected="false">Create account</button>
+      </div>
+      <form class="auth-form" id="auth-form" novalidate>
+        <div class="auth-field" id="auth-name-field" style="display:none;">
+          <label class="auth-label" for="auth-name">Full name</label>
+          <input type="text" class="auth-input" id="auth-name" placeholder="Ms. Lovelace" autocomplete="name" />
+        </div>
+        <div class="auth-field">
+          <label class="auth-label" for="auth-email">School email</label>
+          <input type="email" class="auth-input" id="auth-email" placeholder="teacher@school.edu" autocomplete="email" required />
+        </div>
+        <div class="auth-field">
+          <label class="auth-label" for="auth-password">Password</label>
+          <div class="auth-input-row">
+            <input type="password" class="auth-input" id="auth-password" placeholder="At least 6 characters" autocomplete="current-password" required />
+            <button type="button" class="eye-btn" id="auth-eye-btn" style="height:34px;width:34px;" aria-label="Show password" aria-pressed="false" title="Show"></button>
+          </div>
+        </div>
+        <div class="auth-error" id="auth-error" role="alert"></div>
+        <button type="submit" class="auth-submit" id="auth-submit-btn">Sign in</button>
+      </form>
+    </div>
+  </div>
+
+  <div class="shell" id="app-shell" style="display:none;">
     <aside class="rail">
       <div class="rail-head">
         <div class="rail-title">RLD Proctor</div>
@@ -952,6 +1201,13 @@ pub fn dashboard_html() -> &'static str {
           </span>
           <span class="nav-count" id="cnt-flag">0</span>
         </button>
+        <button type="button" class="nav-item" data-view="rooms">
+          <span class="nav-left">
+            <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M9 4v16M14 10h3M14 14h3"/></svg>
+            <span>Rooms</span>
+          </span>
+          <span class="nav-count" id="cnt-rooms">0</span>
+        </button>
         <button type="button" class="nav-item" data-view="settings">
           <span class="nav-left">
             <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9c.26.6.85 1 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1Z"/></svg>
@@ -972,6 +1228,13 @@ pub fn dashboard_html() -> &'static str {
       </div>
 
       <div class="rail-footer">
+        <div class="rail-account" id="rail-account">
+          <div class="rail-account-meta">
+            <div class="rail-account-name" id="teacher-name">Local Proctor</div>
+            <div class="rail-account-email" id="teacher-email">Token session</div>
+          </div>
+          <button type="button" class="rail-signout" id="sign-out-btn">Sign out</button>
+        </div>
         <button type="button" class="rail-btn" id="copy-url-btn">Copy dashboard URL</button>
         <button type="button" class="rail-btn danger" id="unlock-all-btn">End exam for all</button>
       </div>
@@ -1031,9 +1294,21 @@ pub fn dashboard_html() -> &'static str {
   let tileWidth = 300;
   let latestState = null;
   let latestCredentials = { entrance_code: null, quit_password: null };
+  let latestRooms = { active_room: '', rooms: [] };
   let lastCamGridSig = '';
   let lastInspSig = '';
   let lastSettingsSig = '';
+  let lastRoomsSig = '';
+  let roomsDraftName = '';
+  let roomsError = '';
+  let isAuthenticated = false;
+  let authMode = 'login';
+  let authPasswordVisible = false;
+  let pollTimer = null;
+  let mediaWs = null;
+  let wsReconnectTimer = null;
+  const mediaUrls = new Map();
+  const wsDecoder = new TextDecoder();
   const credEyeVisible = { entrance: false, quit: false };
   const settingsDrafts = { entrance: '', quit: '', allowed: '' };
 
@@ -1043,6 +1318,227 @@ pub fn dashboard_html() -> &'static str {
 
   const esc = (s) => String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
   const isFlagged = (s) => !s.config_key_verified || (s.violations && s.violations.length > 0) || s.status === 'security_paused';
+
+  const sendFocus = (studentId) => {
+    if (mediaWs && mediaWs.readyState === WebSocket.OPEN) {
+      try {
+        mediaWs.send(JSON.stringify({ type: 'focus', student_id: studentId || null }));
+      } catch (_) {}
+    }
+  };
+
+  const setSelectedId = (id) => {
+    const next = id || null;
+    if (selectedId !== next) {
+      selectedId = next;
+      sendFocus(selectedId);
+    }
+  };
+
+  const disconnectMediaWs = () => {
+    if (wsReconnectTimer) {
+      clearTimeout(wsReconnectTimer);
+      wsReconnectTimer = null;
+    }
+    if (mediaWs) {
+      const ws = mediaWs;
+      mediaWs = null;
+      ws.onclose = null;
+      ws.onerror = null;
+      ws.onmessage = null;
+      try { ws.close(); } catch (_) {}
+    }
+    for (const url of mediaUrls.values()) {
+      try { URL.revokeObjectURL(url); } catch (_) {}
+    }
+    mediaUrls.clear();
+  };
+
+  const connectMediaWs = () => {
+    if (!isAuthenticated) return;
+    if (wsReconnectTimer) {
+      clearTimeout(wsReconnectTimer);
+      wsReconnectTimer = null;
+    }
+    if (mediaWs && (mediaWs.readyState === WebSocket.OPEN || mediaWs.readyState === WebSocket.CONNECTING)) {
+      return;
+    }
+    const proto = location.protocol === 'https:' ? 'wss://' : 'ws://';
+    const ws = new WebSocket(proto + location.host + '/ws/proctor');
+    ws.binaryType = 'arraybuffer';
+    mediaWs = ws;
+
+    ws.onopen = () => {
+      sendFocus(selectedId);
+    };
+
+    ws.onmessage = (ev) => {
+      if (!(ev.data instanceof ArrayBuffer)) return;
+      const bytes = new Uint8Array(ev.data);
+      if (bytes.length < 3) return;
+      const kind = bytes[0];
+      const idLen = bytes[1];
+      if (bytes.length <= 2 + idLen) return;
+      const studentId = wsDecoder.decode(bytes.subarray(2, 2 + idLen));
+      const jpeg = bytes.subarray(2 + idLen);
+      const blob = new Blob([jpeg], { type: 'image/jpeg' });
+      const url = URL.createObjectURL(blob);
+      const key = `${kind}:${studentId}`;
+      const prevUrl = mediaUrls.get(key);
+      mediaUrls.set(key, url);
+      const attr = kind === 0 ? 'data-cam-img' : 'data-screen-img';
+      document.querySelectorAll(`img[${attr}="${CSS.escape(studentId)}"]`).forEach((img) => {
+        img.src = url;
+      });
+      if (prevUrl) {
+        try { URL.revokeObjectURL(prevUrl); } catch (_) {}
+      }
+    };
+
+    ws.onclose = () => {
+      if (mediaWs === ws) mediaWs = null;
+      if (isAuthenticated && !wsReconnectTimer) {
+        wsReconnectTimer = setTimeout(() => {
+          wsReconnectTimer = null;
+          connectMediaWs();
+        }, 1500);
+      }
+    };
+
+    ws.onerror = () => {
+      try { ws.close(); } catch (_) {}
+    };
+  };
+
+  const authView = document.getElementById('auth-view');
+  const appShell = document.getElementById('app-shell');
+  const authTabLogin = document.getElementById('auth-tab-login');
+  const authTabRegister = document.getElementById('auth-tab-register');
+  const authNameField = document.getElementById('auth-name-field');
+  const authNameInput = document.getElementById('auth-name');
+  const authEmailInput = document.getElementById('auth-email');
+  const authPasswordInput = document.getElementById('auth-password');
+  const authEyeBtn = document.getElementById('auth-eye-btn');
+  const authErrorEl = document.getElementById('auth-error');
+  const authSubmitBtn = document.getElementById('auth-submit-btn');
+
+  const setAuthError = (msg) => {
+    if (msg) {
+      authErrorEl.textContent = msg;
+      authErrorEl.classList.add('show');
+    } else {
+      authErrorEl.textContent = '';
+      authErrorEl.classList.remove('show');
+    }
+  };
+
+  const setAuthMode = (mode) => {
+    authMode = mode === 'register' ? 'register' : 'login';
+    const isReg = authMode === 'register';
+    authTabLogin.classList.toggle('active', !isReg);
+    authTabLogin.setAttribute('aria-selected', isReg ? 'false' : 'true');
+    authTabRegister.classList.toggle('active', isReg);
+    authTabRegister.setAttribute('aria-selected', isReg ? 'true' : 'false');
+    authNameField.style.display = isReg ? 'flex' : 'none';
+    authPasswordInput.setAttribute('autocomplete', isReg ? 'new-password' : 'current-password');
+    authSubmitBtn.textContent = isReg ? 'Create account' : 'Sign in';
+    setAuthError('');
+  };
+
+  authEyeBtn.innerHTML = eyeSvg(false);
+  authEyeBtn.addEventListener('click', () => {
+    authPasswordVisible = !authPasswordVisible;
+    authPasswordInput.type = authPasswordVisible ? 'text' : 'password';
+    authEyeBtn.setAttribute('aria-pressed', authPasswordVisible ? 'true' : 'false');
+    authEyeBtn.setAttribute('aria-label', authPasswordVisible ? 'Hide password' : 'Show password');
+    authEyeBtn.title = authPasswordVisible ? 'Hide' : 'Show';
+    authEyeBtn.innerHTML = eyeSvg(authPasswordVisible);
+  });
+
+  authTabLogin.addEventListener('click', () => setAuthMode('login'));
+  authTabRegister.addEventListener('click', () => setAuthMode('register'));
+
+  const showAuthScreen = (hasAccounts) => {
+    isAuthenticated = false;
+    if (pollTimer) {
+      clearInterval(pollTimer);
+      pollTimer = null;
+    }
+    disconnectMediaWs();
+    setSelectedId(null);
+    appShell.style.display = 'none';
+    authView.classList.add('open');
+    setAuthMode(hasAccounts ? 'login' : 'register');
+  };
+
+  const enterConsole = (me) => {
+    isAuthenticated = true;
+    authView.classList.remove('open');
+    appShell.style.display = 'flex';
+    const teacherNameEl = document.getElementById('teacher-name');
+    const teacherEmailEl = document.getElementById('teacher-email');
+    if (me && me.teacher) {
+      teacherNameEl.textContent = me.teacher.name || 'Teacher';
+      teacherEmailEl.textContent = me.teacher.email || '';
+    } else {
+      teacherNameEl.textContent = 'Local Proctor';
+      teacherEmailEl.textContent = 'Token session';
+    }
+    requestAnimationFrame(() => syncDensityThumb(false));
+    connectMediaWs();
+    refresh(true);
+    if (!pollTimer) {
+      pollTimer = setInterval(refresh, 1200);
+    }
+  };
+
+  document.getElementById('auth-form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    setAuthError('');
+    const isReg = authMode === 'register';
+    const payload = isReg
+      ? {
+          name: authNameInput.value.trim(),
+          email: authEmailInput.value.trim(),
+          password: authPasswordInput.value,
+        }
+      : {
+          email: authEmailInput.value.trim(),
+          password: authPasswordInput.value,
+        };
+    authSubmitBtn.disabled = true;
+    try {
+      const res = await fetch(isReg ? '/api/auth/register' : '/api/auth/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setAuthError(data.error || 'Authentication failed');
+        return;
+      }
+      authPasswordInput.value = '';
+      enterConsole({ authenticated: true, teacher: data.teacher || null });
+    } catch (_) {
+      setAuthError('Unable to reach proctor server');
+    } finally {
+      authSubmitBtn.disabled = false;
+    }
+  });
+
+  document.getElementById('sign-out-btn').addEventListener('click', async () => {
+    try {
+      await fetch('/api/auth/logout', { method: 'POST' });
+    } catch (_) {}
+    latestState = null;
+    latestRooms = { active_room: '', rooms: [] };
+    lastCamGridSig = '';
+    lastInspSig = '';
+    lastSettingsSig = '';
+    lastRoomsSig = '';
+    showAuthScreen(true);
+  });
 
   const statusMeta = (status) => {
     switch (status) {
@@ -1121,17 +1617,19 @@ pub fn dashboard_html() -> &'static str {
     await refresh(true);
   };
 
+  const switchView = (view) => {
+    currentView = view;
+    document.querySelectorAll('.nav-item').forEach((b) => b.classList.toggle('active', b.dataset.view === view));
+    const titles = { cameras: 'Cameras', roster: 'Roster', attention: 'Needs attention', rooms: 'Exam rooms', settings: 'Exam settings' };
+    document.getElementById('ws-title').textContent = titles[currentView] || 'Monitor';
+    document.getElementById('density-ctrl').style.display = currentView === 'cameras' ? 'inline-flex' : 'none';
+    document.getElementById('search-input').style.display = (currentView === 'settings' || currentView === 'rooms') ? 'none' : 'block';
+    if (currentView === 'cameras') requestAnimationFrame(() => syncDensityThumb(false));
+    render();
+  };
+
   document.querySelectorAll('.nav-item').forEach((btn) => {
-    btn.addEventListener('click', () => {
-      currentView = btn.dataset.view;
-      document.querySelectorAll('.nav-item').forEach((b) => b.classList.toggle('active', b === btn));
-      const titles = { cameras: 'Cameras', roster: 'Roster', attention: 'Needs attention', settings: 'Exam settings' };
-      document.getElementById('ws-title').textContent = titles[currentView] || 'Monitor';
-      document.getElementById('density-ctrl').style.display = currentView === 'cameras' ? 'inline-flex' : 'none';
-      document.getElementById('search-input').style.display = currentView === 'settings' ? 'none' : 'block';
-      if (currentView === 'cameras') requestAnimationFrame(() => syncDensityThumb(false));
-      render();
-    });
+    btn.addEventListener('click', () => switchView(btn.dataset.view));
   });
 
   document.querySelectorAll('#density-ctrl button').forEach((btn) => {
@@ -1168,7 +1666,7 @@ pub fn dashboard_html() -> &'static str {
   });
 
   document.getElementById('insp-close').addEventListener('click', () => {
-    selectedId = null;
+    setSelectedId(null);
     document.getElementById('inspector').classList.remove('open');
     render();
   });
@@ -1185,6 +1683,7 @@ pub fn dashboard_html() -> &'static str {
     }
     const s = (latestState.students || []).find((x) => x.student_id === selectedId);
     if (!s) {
+      setSelectedId(null);
       panel.classList.remove('open');
       lastInspSig = '';
       return;
@@ -1204,15 +1703,17 @@ pub fn dashboard_html() -> &'static str {
     lastInspSig = inspSig;
 
     const [dotCls, label] = statusMeta(s.status);
+    const camSrc = mediaUrls.get(`0:${s.student_id}`) || '';
+    const screenSrc = mediaUrls.get(`1:${s.student_id}`) || '';
     const camHtml = s.status === 'exited'
       ? `<span data-cam-placeholder="${esc(s.student_id)}">Session ended — camera closed</span>`
       : (s.has_webcam
-        ? `<img data-cam-img="${esc(s.student_id)}" src="/api/webcam-stream/${encodeURIComponent(s.student_id)}" alt="${esc(s.student_id)}" />`
+        ? `<img data-cam-img="${esc(s.student_id)}"${camSrc ? ` src="${camSrc}"` : ''} alt="${esc(s.student_id)}" />`
         : `<span data-cam-placeholder="${esc(s.student_id)}">Camera off</span>`);
     const screenHtml = s.status === 'exited'
       ? '<span>Session ended</span>'
       : (s.has_screen
-        ? `<img src="/api/screen-stream/${encodeURIComponent(s.student_id)}" alt="Student live screen" />`
+        ? `<img data-screen-img="${esc(s.student_id)}"${screenSrc ? ` src="${screenSrc}"` : ''} alt="Student live screen" />`
         : '<span>Waiting for screen…</span>');
     const alertHtml = (s.violations && s.violations.length > 0)
       ? `<div class="insp-alert">${s.violations.map(esc).join('<br/>')}</div>`
@@ -1241,6 +1742,139 @@ pub fn dashboard_html() -> &'static str {
     if (!latestState) return;
     const wrap = document.getElementById('content-wrap');
 
+    if (currentView === 'rooms') {
+      lastCamGridSig = '';
+      lastSettingsSig = '';
+      const rooms = Array.isArray(latestRooms.rooms) ? latestRooms.rooms : [];
+      const activeRoom = latestRooms.active_room || (latestState && latestState.room_code) || '';
+      const roomsSig = JSON.stringify([activeRoom, rooms, roomsError]);
+      if (roomsSig === lastRoomsSig) {
+        renderInspector();
+        return;
+      }
+
+      const prevRoomInput = document.getElementById('new-room-name');
+      if (prevRoomInput) roomsDraftName = prevRoomInput.value;
+      const activeEl = document.activeElement;
+      const hadInputFocus = activeEl && activeEl.id === 'new-room-name';
+      const prevSelStart = hadInputFocus && typeof activeEl.selectionStart === 'number' ? activeEl.selectionStart : null;
+      const prevSelEnd = hadInputFocus && typeof activeEl.selectionEnd === 'number' ? activeEl.selectionEnd : null;
+
+      lastRoomsSig = roomsSig;
+      const rowsHtml = rooms.length
+        ? `<table>
+            <thead><tr>
+              <th>Room</th><th>Code</th><th style="text-align:right">Actions</th>
+            </tr></thead>
+            <tbody>${rooms.map((r) => {
+              const isAct = r.code === activeRoom;
+              return `<tr class="${isAct ? 'selected' : ''}">
+                <td><strong>${esc(r.name)}</strong>${isAct ? ' <span class="dot dot-ok" style="margin-left:8px;margin-right:4px"></span><span class="muted" style="font-size:11.5px">Active</span>' : ''}</td>
+                <td class="mono">${esc(r.code)}</td>
+                <td style="text-align:right">
+                  <div class="room-actions">
+                    <button type="button" class="row-action" data-copy-rld="${esc(r.code)}">Copy rld:// link</button>
+                    <button type="button" class="row-action primary" data-open-room="${esc(r.code)}">Open</button>
+                    <button type="button" class="row-action danger" data-del-room="${esc(r.code)}">Delete</button>
+                  </div>
+                </td>
+              </tr>`;
+            }).join('')}</tbody>
+          </table>`
+        : `<div class="empty">
+            <div class="empty-title">No exam rooms yet</div>
+            <div class="empty-sub">Create a room above to generate a room code for students</div>
+          </div>`;
+
+      wrap.innerHTML = `
+        <div class="rooms-bar">
+          <input type="text" class="add-input" id="new-room-name" placeholder="Room name (e.g. AP CS Period 2)" />
+          <button type="button" class="add-btn" id="create-room-btn">New room</button>
+        </div>
+        ${roomsError ? `<div class="rooms-err">${esc(roomsError)}</div>` : ''}
+        ${rowsHtml}
+      `;
+
+      const nameInput = document.getElementById('new-room-name');
+      nameInput.value = roomsDraftName;
+      nameInput.addEventListener('input', () => { roomsDraftName = nameInput.value; });
+
+      const createRoom = async () => {
+        const name = nameInput.value.trim();
+        if (!name) {
+          roomsError = 'Enter a room name';
+          lastRoomsSig = '';
+          render();
+          return;
+        }
+        roomsError = '';
+        const res = await fetch('/api/rooms', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          roomsError = data.error || 'Failed to create room';
+          lastRoomsSig = '';
+          render();
+          return;
+        }
+        roomsDraftName = '';
+        lastRoomsSig = '';
+        await refresh(true);
+      };
+
+      document.getElementById('create-room-btn').addEventListener('click', createRoom);
+      nameInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') createRoom(); });
+
+      wrap.querySelectorAll('[data-copy-rld]').forEach((btn) => {
+        btn.addEventListener('click', async () => {
+          const code = btn.dataset.copyRld;
+          const link = `rld://join?proctor=${encodeURIComponent(location.origin)}&room=${encodeURIComponent(code)}`;
+          try {
+            await navigator.clipboard.writeText(link);
+            btn.textContent = 'Copied link';
+            setTimeout(() => { btn.textContent = 'Copy rld:// link'; }, 1400);
+          } catch (_) {}
+        });
+      });
+
+      wrap.querySelectorAll('[data-open-room]').forEach((btn) => {
+        btn.addEventListener('click', async () => {
+          const code = btn.dataset.openRoom;
+          await fetch('/api/rooms/select', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ code }),
+          });
+          lastRoomsSig = '';
+          await refresh(true);
+          switchView('cameras');
+        });
+      });
+
+      wrap.querySelectorAll('[data-del-room]').forEach((btn) => {
+        btn.addEventListener('click', async () => {
+          const code = btn.dataset.delRoom;
+          await fetch(`/api/rooms/${encodeURIComponent(code)}`, { method: 'DELETE' });
+          lastRoomsSig = '';
+          await refresh(true);
+        });
+      });
+
+      if (hadInputFocus) {
+        nameInput.focus();
+        if (prevSelStart !== null && prevSelEnd !== null) {
+          try { nameInput.setSelectionRange(prevSelStart, prevSelEnd); } catch (_) {}
+        }
+      }
+
+      renderInspector();
+      return;
+    }
+
+    lastRoomsSig = '';
     if (currentView === 'settings') {
       lastCamGridSig = '';
       const p = latestState.policy || {};
@@ -1502,14 +2136,16 @@ pub fn dashboard_html() -> &'static str {
 
       const tiles = list.map((s) => {
         const [dotCls] = statusMeta(s.status);
+        const camSrc = mediaUrls.get(`0:${s.student_id}`) || '';
+        const screenSrc = mediaUrls.get(`1:${s.student_id}`) || '';
         const media = s.has_webcam
-          ? `<img data-cam-img="${esc(s.student_id)}" src="/api/webcam-stream/${encodeURIComponent(s.student_id)}" alt="${esc(s.student_id)}" />`
+          ? `<img data-cam-img="${esc(s.student_id)}"${camSrc ? ` src="${camSrc}"` : ''} alt="${esc(s.student_id)}" />`
           : `<span data-cam-placeholder="${esc(s.student_id)}">Camera off</span>`;
         const flagBar = (s.violations && s.violations.length > 0)
           ? `<div class="cam-flag-bar">${esc(s.violations[0])}</div>`
           : (!s.config_key_verified ? '<div class="cam-flag-bar">Config key mismatch</div>' : '');
         const pip = s.has_screen
-          ? `<div class="cam-pip${flagBar ? ' lifted' : ''}"><img src="/api/screen-stream/${encodeURIComponent(s.student_id)}" alt="Student screen" /></div>`
+          ? `<div class="cam-pip${flagBar ? ' lifted' : ''}"><img data-screen-img="${esc(s.student_id)}"${screenSrc ? ` src="${screenSrc}"` : ''} alt="Student screen" /></div>`
           : '';
         const cls = ['cam-tile', isFlagged(s) ? 'flagged' : '', selectedId === s.student_id ? 'selected' : ''].join(' ');
         return `<div class="${cls}" data-select="${esc(s.student_id)}">
@@ -1555,7 +2191,7 @@ pub fn dashboard_html() -> &'static str {
     wrap.querySelectorAll('[data-select]').forEach((el) => {
       el.addEventListener('click', (e) => {
         if (e.target.closest('[data-unlock]')) return;
-        selectedId = el.dataset.select;
+        setSelectedId(el.dataset.select);
         render();
       });
     });
@@ -1570,14 +2206,23 @@ pub fn dashboard_html() -> &'static str {
   };
 
   const refresh = async (forceRender = false) => {
+    if (!isAuthenticated) return;
     try {
-      const [res, credsRes] = await Promise.all([
+      const [res, credsRes, roomsRes] = await Promise.all([
         fetch('/api/state'),
         fetch('/api/credentials'),
+        fetch('/api/rooms'),
       ]);
+      if (res.status === 401) {
+        showAuthScreen(true);
+        return;
+      }
       latestState = await res.json();
       if (credsRes.ok) {
         latestCredentials = await credsRes.json();
+      }
+      if (roomsRes.ok) {
+        latestRooms = await roomsRes.json();
       }
       const students = latestState.students || [];
       const camCount = students.filter((s) => s.status !== 'exited' && s.has_webcam).length;
@@ -1585,6 +2230,7 @@ pub fn dashboard_html() -> &'static str {
       document.getElementById('room-label').textContent = latestState.room_code;
       document.getElementById('cnt-cams').textContent = camCount;
       document.getElementById('cnt-all').textContent = latestState.total_students;
+      document.getElementById('cnt-rooms').textContent = Array.isArray(latestRooms.rooms) ? latestRooms.rooms.length : 0;
       const flagEl = document.getElementById('cnt-flag');
       flagEl.textContent = latestState.flagged_count;
       flagEl.classList.toggle('alert', latestState.flagged_count > 0);
@@ -1598,13 +2244,29 @@ pub fn dashboard_html() -> &'static str {
         ? latestState.expected_config_key.slice(0, 16) + '…'
         : 'Unpinned';
 
-      if (forceRender) lastSettingsSig = '';
+      if (forceRender) {
+        lastSettingsSig = '';
+        lastRoomsSig = '';
+      }
       render();
     } catch (_) {}
   };
 
-  refresh();
-  setInterval(refresh, 1200);
+  const initAuth = async () => {
+    try {
+      const res = await fetch('/api/auth/me');
+      const me = await res.json();
+      if (me && me.authenticated) {
+        enterConsole(me);
+      } else {
+        showAuthScreen(Boolean(me && me.has_accounts));
+      }
+    } catch (_) {
+      showAuthScreen(false);
+    }
+  };
+
+  initAuth();
 </script>
 </body>
 </html>"##

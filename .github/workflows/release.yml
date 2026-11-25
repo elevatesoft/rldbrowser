@@ -1,0 +1,61 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-14
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build macOS release bundle
+        run: ./scripts/bundle-macos.sh
+
+      - name: Package release archives
+        run: |
+          APP_ZIP="dist/RLD-Browser-${GITHUB_REF_NAME}-macos-arm64.zip"
+          PROCTOR_TAR="dist/rld-proctor-${GITHUB_REF_NAME}-macos-arm64.tar.gz"
+
+          ditto -c -k --sequesterRsrc --keepParent "dist/RLD Browser.app" "$APP_ZIP"
+          tar -czf "$PROCTOR_TAR" -C dist rld-proctor
+
+          echo "APP_ZIP=$APP_ZIP" >> "$GITHUB_ENV"
+          echo "PROCTOR_TAR=$PROCTOR_TAR" >> "$GITHUB_ENV"
+
+      - name: Extract changelog notes
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          awk -v ver="$VERSION" '
+            index($0, "## [" ver "]") == 1 { found=1; next }
+            found && /^## \[/ { exit }
+            found { print }
+          ' CHANGELOG.md | sed '/./,$!d' > release_notes.md || true
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ -s release_notes.md ]; then
+            gh release create "$GITHUB_REF_NAME" \
+              "$APP_ZIP" \
+              "$PROCTOR_TAR" \
+              --title "RLD Browser $GITHUB_REF_NAME" \
+              --notes-file release_notes.md
+          else
+            gh release create "$GITHUB_REF_NAME" \
+              "$APP_ZIP" \
+              "$PROCTOR_TAR" \
+              --title "RLD Browser $GITHUB_REF_NAME" \
+              --generate-notes
+          fi

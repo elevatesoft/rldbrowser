@@ -1,11 +1,15 @@
+#[allow(dead_code)]
+mod accounts;
 mod dashboard;
+#[allow(dead_code)]
+mod ws;
 
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream, UdpSocket};
+use std::net::{Shutdown, TcpListener, TcpStream, UdpSocket};
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -38,6 +42,10 @@ struct Cli {
     /// Optional proctor admin auth token (defaults to a random 128-bit hex token per session)
     #[arg(long)]
     token: Option<String>,
+
+    /// Path to persist teacher accounts and exam rooms JSON
+    #[arg(long, default_value = "rld-proctor-data.json")]
+    data: PathBuf,
 }
 
 #[derive(Debug, Default)]
@@ -471,6 +479,39 @@ struct CredentialUpdateRequest {
     value: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct RegisterRequest {
+    name: String,
+    email: String,
+    password: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct LoginRequest {
+    email: String,
+    password: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateRoomRequest {
+    name: String,
+    #[serde(default)]
+    code: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SelectRoomRequest {
+    code: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct WsClientMessage {
+    #[serde(rename = "type")]
+    msg_type: String,
+    #[serde(default)]
+    student_id: Option<String>,
+}
+
 fn detect_lan_ip() -> Option<String> {
     let sock = UdpSocket::bind("0.0.0.0:0").ok()?;
     sock.connect("8.8.8.8:80").ok()?;
@@ -488,15 +529,6 @@ const MAX_STUDENT_ID_CHARS: usize = 64;
 const MAX_VIOLATIONS: usize = 32;
 const MAX_VIOLATION_CHARS: usize = 256;
 const MAX_STUDENTS: usize = 256;
-
-const UNAUTHORIZED_HTML: &[u8] = br#"<!DOCTYPE html>
-<html lang="en">
-<head><meta charset="utf-8" /><title>RLD Proctor &mdash; Authentication Required</title></head>
-<body style="font-family:-apple-system,system-ui,sans-serif;max-width:480px;margin:80px auto;padding:0 20px;color:#192230;">
-<h1>RLD Proctor &mdash; Authentication Required</h1>
-<p>Open the tokenized dashboard URL printed in the <code>rld-proctor</code> terminal to authenticate this browser session.</p>
-</body>
-</html>"#;
 
 fn truncate_chars(s: &str, max_chars: usize) -> String {
     s.chars().take(max_chars).collect()
@@ -559,15 +591,19 @@ fn extract_query_param(query: &str, key: &str) -> Option<String> {
 }
 
 fn cookie_has_proctor_token(cookie_header: &str, expected: &str) -> bool {
+    extract_cookie_value(cookie_header, "rb_proctor")
+        .is_some_and(|val| constant_time_eq(val.as_bytes(), expected.as_bytes()))
+}
+
+fn extract_cookie_value<'a>(cookie_header: &'a str, target_name: &str) -> Option<&'a str> {
     for part in cookie_header.split(';') {
         if let Some((name, val)) = part.trim().split_once('=')
-            && name.trim() == "rb_proctor"
-            && constant_time_eq(val.trim().as_bytes(), expected.as_bytes())
+            && name.trim() == target_name
         {
-            return true;
+            return Some(val.trim());
         }
     }
-    false
+    None
 }
 
 struct ConnectionGuard {
@@ -700,6 +736,7 @@ fn main() -> ExitCode {
         initial_store.set_policy(RoomStore::policy_from_config(cfg));
     }
     let store = Arc::new(Mutex::new(initial_store));
+    let accounts = Arc::new(Mutex::new(accounts::AccountStore::new(Some(cli.data))));
     let token = Arc::new(proctor_token);
     let active_connections = Arc::new(AtomicUsize::new(0));
 
@@ -715,10 +752,11 @@ fn main() -> ExitCode {
             continue;
         };
         let store = Arc::clone(&store);
+        let accounts = Arc::clone(&accounts);
         let token = Arc::clone(&token);
         std::thread::spawn(move || {
             let _guard = guard;
-            let _ = handle_connection(stream, &store, &token);
+            let _ = handle_connection(stream, &store, &accounts, &token);
         });
     }
 
@@ -728,6 +766,7 @@ fn main() -> ExitCode {
 fn handle_connection(
     mut stream: TcpStream,
     store: &Arc<Mutex<RoomStore>>,
+    accounts: &Arc<Mutex<accounts::AccountStore>>,
     proctor_token: &str,
 ) -> std::io::Result<()> {
     let _ = stream.set_nodelay(true);
@@ -772,7 +811,10 @@ fn handle_connection(
         let mut content_length = 0usize;
         let mut connection_close = false;
         let mut body_too_large = false;
-        let mut authenticated = false;
+        let mut token_auth = false;
+        let mut session_token: Option<String> = None;
+        let mut upgrade_websocket = false;
+        let mut ws_key: Option<String> = None;
         let mut header_count = 0usize;
         loop {
             let line = match read_bounded_line(&mut reader, MAX_HEADER_LINE_BYTES) {
@@ -815,12 +857,25 @@ fn handle_connection(
                     && val.to_ascii_lowercase().contains("close")
                 {
                     connection_close = true;
-                } else if (name.eq_ignore_ascii_case("x-proctor-token")
-                    && constant_time_eq(val.as_bytes(), proctor_token.as_bytes()))
-                    || (name.eq_ignore_ascii_case("cookie")
-                        && cookie_has_proctor_token(val, proctor_token))
+                } else if name.eq_ignore_ascii_case("upgrade")
+                    && val.eq_ignore_ascii_case("websocket")
                 {
-                    authenticated = true;
+                    upgrade_websocket = true;
+                } else if name.eq_ignore_ascii_case("sec-websocket-key") && !val.is_empty() {
+                    ws_key = Some(val.to_string());
+                } else if name.eq_ignore_ascii_case("x-proctor-token")
+                    && constant_time_eq(val.as_bytes(), proctor_token.as_bytes())
+                {
+                    token_auth = true;
+                } else if name.eq_ignore_ascii_case("cookie") {
+                    if cookie_has_proctor_token(val, proctor_token) {
+                        token_auth = true;
+                    }
+                    if let Some(sess) = extract_cookie_value(val, "rb_session")
+                        && !sess.is_empty()
+                    {
+                        session_token = Some(sess.to_string());
+                    }
                 }
             }
         }
@@ -838,6 +893,18 @@ fn handle_connection(
         if content_length > 0 {
             reader.read_exact(&mut body)?;
         }
+
+        let teacher = session_token.as_deref().and_then(|tok| {
+            accounts
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .authenticate(tok)
+        });
+        let authenticated = token_auth || teacher.is_some();
+        let owner_id = teacher
+            .as_ref()
+            .map(|t| t.id.as_str())
+            .unwrap_or("local-proctor");
 
         if method == "GET"
             && path == "/"
@@ -959,22 +1026,263 @@ fn handle_connection(
             );
         }
 
+        if method == "DELETE"
+            && let Some(room_code) = path.strip_prefix("/api/rooms/")
+        {
+            if !authenticated {
+                return write_unauthorized_api(&mut stream);
+            }
+            let decoded_code = percent_decode(room_code);
+            let ok = accounts
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .delete_room(owner_id, &decoded_code);
+            let payload = serde_json::json!({ "ok": ok }).to_string();
+            return write_response(
+                &mut stream,
+                "200 OK",
+                "application/json",
+                payload.as_bytes(),
+            );
+        }
+
         return match (method, path) {
-            ("GET", "/") => {
+            ("GET", "/") => write_response(
+                &mut stream,
+                "200 OK",
+                "text/html; charset=utf-8",
+                dashboard::dashboard_html().as_bytes(),
+            ),
+            ("GET", "/ws/proctor") => {
                 if !authenticated {
+                    return write_unauthorized_api(&mut stream);
+                }
+                if !upgrade_websocket {
                     return write_response(
                         &mut stream,
-                        "401 Unauthorized",
-                        "text/html; charset=utf-8",
-                        UNAUTHORIZED_HTML,
+                        "400 Bad Request",
+                        "application/json",
+                        br#"{"error":"websocket upgrade required"}"#,
                     );
                 }
-                write_response(
+                let Some(key) = ws_key else {
+                    return write_response(
+                        &mut stream,
+                        "400 Bad Request",
+                        "application/json",
+                        br#"{"error":"missing Sec-WebSocket-Key"}"#,
+                    );
+                };
+                drop(reader);
+                serve_proctor_ws(stream, store, &key)
+            }
+            ("GET", "/api/auth/me") => {
+                let has_accounts = accounts
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .has_any_accounts();
+                let payload = serde_json::json!({
+                    "authenticated": authenticated,
+                    "teacher": teacher,
+                    "has_accounts": has_accounts,
+                    "token_auth": token_auth,
+                })
+                .to_string();
+                write_response(&mut stream, "200 OK", "application/json", payload.as_bytes())
+            }
+            ("POST", "/api/auth/register") => {
+                match serde_json::from_slice::<RegisterRequest>(&body) {
+                    Ok(req) => {
+                        let res = accounts
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .register(&req.name, &req.email, &req.password);
+                        match res {
+                            Ok((view, sess_tok)) => {
+                                let payload = serde_json::json!({ "teacher": view }).to_string();
+                                let cookie = format!(
+                                    "Set-Cookie: rb_session={sess_tok}; Path=/; HttpOnly; SameSite=Strict\r\n"
+                                );
+                                write_response_with_headers(
+                                    &mut stream,
+                                    "200 OK",
+                                    "application/json",
+                                    &cookie,
+                                    payload.as_bytes(),
+                                )
+                            }
+                            Err(err) => {
+                                let payload = serde_json::json!({ "error": err }).to_string();
+                                write_response(
+                                    &mut stream,
+                                    "400 Bad Request",
+                                    "application/json",
+                                    payload.as_bytes(),
+                                )
+                            }
+                        }
+                    }
+                    Err(_) => write_response(
+                        &mut stream,
+                        "400 Bad Request",
+                        "application/json",
+                        br#"{"error":"invalid registration payload"}"#,
+                    ),
+                }
+            }
+            ("POST", "/api/auth/login") => match serde_json::from_slice::<LoginRequest>(&body) {
+                Ok(req) => {
+                    let res = accounts
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .login(&req.email, &req.password);
+                    match res {
+                        Ok((view, sess_tok)) => {
+                            let payload = serde_json::json!({ "teacher": view }).to_string();
+                            let cookie = format!(
+                                "Set-Cookie: rb_session={sess_tok}; Path=/; HttpOnly; SameSite=Strict\r\n"
+                            );
+                            write_response_with_headers(
+                                &mut stream,
+                                "200 OK",
+                                "application/json",
+                                &cookie,
+                                payload.as_bytes(),
+                            )
+                        }
+                        Err(err) => {
+                            let payload = serde_json::json!({ "error": err }).to_string();
+                            write_response(
+                                &mut stream,
+                                "401 Unauthorized",
+                                "application/json",
+                                payload.as_bytes(),
+                            )
+                        }
+                    }
+                }
+                Err(_) => write_response(
+                    &mut stream,
+                    "400 Bad Request",
+                    "application/json",
+                    br#"{"error":"invalid login payload"}"#,
+                ),
+            },
+            ("POST", "/api/auth/logout") => {
+                if let Some(tok) = session_token.as_deref() {
+                    accounts
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .logout(tok);
+                }
+                let clear_cookies = "Set-Cookie: rb_session=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict\r\n\
+                                     Set-Cookie: rb_proctor=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict\r\n";
+                write_response_with_headers(
                     &mut stream,
                     "200 OK",
-                    "text/html; charset=utf-8",
-                    dashboard::dashboard_html().as_bytes(),
+                    "application/json",
+                    clear_cookies,
+                    br#"{"ok":true}"#,
                 )
+            }
+            ("GET", "/api/rooms") => {
+                if !authenticated {
+                    return write_unauthorized_api(&mut stream);
+                }
+                let active_room = store
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .room_code
+                    .clone();
+                let rooms = accounts
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .list_rooms_for_owner(owner_id);
+                let payload = serde_json::json!({
+                    "active_room": active_room,
+                    "rooms": rooms,
+                })
+                .to_string();
+                write_response(&mut stream, "200 OK", "application/json", payload.as_bytes())
+            }
+            ("POST", "/api/rooms") => {
+                if !authenticated {
+                    return write_unauthorized_api(&mut stream);
+                }
+                match serde_json::from_slice::<CreateRoomRequest>(&body) {
+                    Ok(req) => {
+                        let custom_code = req
+                            .code
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|c| !c.is_empty());
+                        let res = accounts
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .create_room(owner_id, &req.name, custom_code);
+                        match res {
+                            Ok(room) => {
+                                store
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .room_code = room.code.clone();
+                                let json = serde_json::to_vec(&room).unwrap_or_default();
+                                write_response(&mut stream, "200 OK", "application/json", &json)
+                            }
+                            Err(err) => {
+                                let payload = serde_json::json!({ "error": err }).to_string();
+                                write_response(
+                                    &mut stream,
+                                    "400 Bad Request",
+                                    "application/json",
+                                    payload.as_bytes(),
+                                )
+                            }
+                        }
+                    }
+                    Err(_) => write_response(
+                        &mut stream,
+                        "400 Bad Request",
+                        "application/json",
+                        br#"{"error":"invalid room payload"}"#,
+                    ),
+                }
+            }
+            ("POST", "/api/rooms/select") => {
+                if !authenticated {
+                    return write_unauthorized_api(&mut stream);
+                }
+                match serde_json::from_slice::<SelectRoomRequest>(&body) {
+                    Ok(req) => {
+                        let code = req.code.trim().to_ascii_uppercase();
+                        if code.is_empty() {
+                            return write_response(
+                                &mut stream,
+                                "400 Bad Request",
+                                "application/json",
+                                br#"{"error":"room code cannot be empty"}"#,
+                            );
+                        }
+                        store.lock().unwrap_or_else(|e| e.into_inner()).room_code = code.clone();
+                        let payload = serde_json::json!({
+                            "ok": true,
+                            "active_room": code,
+                        })
+                        .to_string();
+                        write_response(
+                            &mut stream,
+                            "200 OK",
+                            "application/json",
+                            payload.as_bytes(),
+                        )
+                    }
+                    Err(_) => write_response(
+                        &mut stream,
+                        "400 Bad Request",
+                        "application/json",
+                        br#"{"error":"invalid room selection payload"}"#,
+                    ),
+                }
             }
             ("GET", "/api/state") => {
                 if !authenticated {
@@ -1150,6 +1458,167 @@ fn handle_connection(
     }
 }
 
+fn serve_proctor_ws(
+    mut stream: TcpStream,
+    store: &Arc<Mutex<RoomStore>>,
+    ws_key: &str,
+) -> std::io::Result<()> {
+    ws::send_handshake(&mut stream, ws_key)?;
+    let _ = stream.set_nodelay(true);
+    let _ = stream.set_write_timeout(Some(CONNECTION_IO_TIMEOUT));
+
+    let mut read_stream = stream.try_clone()?;
+    let _ = read_stream.set_read_timeout(None);
+
+    let focused_id: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let ws_closed = Arc::new(AtomicBool::new(false));
+    let write_stream = Arc::new(Mutex::new(stream));
+
+    let focused_reader = Arc::clone(&focused_id);
+    let closed_reader = Arc::clone(&ws_closed);
+    let pong_stream = Arc::clone(&write_stream);
+    let reader_handle = std::thread::spawn(move || {
+        while !closed_reader.load(Ordering::Acquire) {
+            match ws::read_frame(&mut read_stream, 4096) {
+                Ok(ws::WsIncoming::Text(text)) => {
+                    if let Ok(msg) = serde_json::from_str::<WsClientMessage>(&text)
+                        && msg.msg_type == "focus"
+                    {
+                        *focused_reader.lock().unwrap_or_else(|e| e.into_inner()) = msg.student_id;
+                    }
+                }
+                Ok(ws::WsIncoming::Binary(_)) => {}
+                Ok(ws::WsIncoming::Ping(payload)) => {
+                    let mut ws_out = pong_stream.lock().unwrap_or_else(|e| e.into_inner());
+                    if ws::write_pong_frame(&mut ws_out, &payload).is_err() {
+                        break;
+                    }
+                }
+                Ok(ws::WsIncoming::Close) => {
+                    let mut ws_out = pong_stream.lock().unwrap_or_else(|e| e.into_inner());
+                    let _ = ws::write_close_frame(&mut ws_out);
+                    break;
+                }
+                Err(_) => break,
+            }
+        }
+        closed_reader.store(true, Ordering::Release);
+    });
+
+    let mut last_sent_cam_seq: BTreeMap<String, (u64, Instant)> = BTreeMap::new();
+    let mut last_sent_screen_seq: BTreeMap<String, (u64, Instant)> = BTreeMap::new();
+
+    while !ws_closed.load(Ordering::Acquire) {
+        let focused = focused_id.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let active: Vec<(String, SharedWebcamChannel, SharedWebcamChannel)> = {
+            let guard = store.lock().unwrap_or_else(|e| e.into_inner());
+            guard
+                .students
+                .iter()
+                .filter(|(_, rec)| rec.status != StudentStatus::Exited)
+                .map(|(sid, rec)| {
+                    (
+                        sid.clone(),
+                        Arc::clone(&rec.webcam_channel),
+                        Arc::clone(&rec.screen_channel),
+                    )
+                })
+                .collect()
+        };
+
+        let n = active.len();
+        let now = Instant::now();
+
+        // Prune exited/removed students so rejoining students deliver their first frame immediately.
+        last_sent_cam_seq.retain(|sid, _| active.iter().any(|(a, _, _)| a == sid));
+        last_sent_screen_seq.retain(|sid, _| active.iter().any(|(a, _, _)| a == sid));
+
+        let mut write_failed = false;
+        for (sid, cam_ch, screen_ch) in &active {
+            if ws_closed.load(Ordering::Acquire) {
+                break;
+            }
+            let is_focused = focused.as_deref() == Some(sid.as_str()) || n <= 1;
+            let min_cam_interval = if is_focused {
+                Duration::ZERO
+            } else {
+                Duration::from_millis(180)
+            };
+            let min_screen_interval = if is_focused {
+                Duration::ZERO
+            } else {
+                Duration::from_millis(450)
+            };
+
+            let cam_frame = {
+                let ch = cam_ch.0.lock().unwrap_or_else(|e| e.into_inner());
+                let due = match last_sent_cam_seq.get(sid) {
+                    None => true,
+                    Some(&(last_seq, last_time)) => {
+                        ch.seq > last_seq && now.duration_since(last_time) >= min_cam_interval
+                    }
+                };
+                if !ch.closed && ch.seq > 0 && due {
+                    ch.jpeg.clone().map(|jpeg| (ch.seq, jpeg))
+                } else {
+                    None
+                }
+            };
+            if let Some((seq, jpeg)) = cam_frame {
+                let packet = ws::encode_media_packet(ws::MEDIA_KIND_WEBCAM, sid, &jpeg);
+                let res = {
+                    let mut ws_out = write_stream.lock().unwrap_or_else(|e| e.into_inner());
+                    ws::write_binary_frame(&mut ws_out, &packet)
+                };
+                if res.is_err() {
+                    write_failed = true;
+                    break;
+                }
+                last_sent_cam_seq.insert(sid.clone(), (seq, now));
+            }
+
+            let screen_frame = {
+                let ch = screen_ch.0.lock().unwrap_or_else(|e| e.into_inner());
+                let due = match last_sent_screen_seq.get(sid) {
+                    None => true,
+                    Some(&(last_seq, last_time)) => {
+                        ch.seq > last_seq && now.duration_since(last_time) >= min_screen_interval
+                    }
+                };
+                if !ch.closed && ch.seq > 0 && due {
+                    ch.jpeg.clone().map(|jpeg| (ch.seq, jpeg))
+                } else {
+                    None
+                }
+            };
+            if let Some((seq, jpeg)) = screen_frame {
+                let packet = ws::encode_media_packet(ws::MEDIA_KIND_SCREEN, sid, &jpeg);
+                let res = {
+                    let mut ws_out = write_stream.lock().unwrap_or_else(|e| e.into_inner());
+                    ws::write_binary_frame(&mut ws_out, &packet)
+                };
+                if res.is_err() {
+                    write_failed = true;
+                    break;
+                }
+                last_sent_screen_seq.insert(sid.clone(), (seq, now));
+            }
+        }
+
+        if write_failed {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(16));
+    }
+
+    ws_closed.store(true, Ordering::Release);
+    if let Ok(ws_out) = write_stream.lock() {
+        let _ = ws_out.shutdown(Shutdown::Both);
+    }
+    let _ = reader_handle.join();
+    Ok(())
+}
+
 fn serve_mjpeg_stream(stream: &mut TcpStream, channel: SharedWebcamChannel) -> std::io::Result<()> {
     let _ = stream.set_write_timeout(Some(CONNECTION_IO_TIMEOUT));
     stream.write_all(
@@ -1253,9 +1722,19 @@ fn write_response(
     content_type: &str,
     body: &[u8],
 ) -> std::io::Result<()> {
+    write_response_with_headers(stream, status, content_type, "", body)
+}
+
+fn write_response_with_headers(
+    stream: &mut TcpStream,
+    status: &str,
+    content_type: &str,
+    extra_headers: &str,
+    body: &[u8],
+) -> std::io::Result<()> {
     write!(
         stream,
-        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\n{extra_headers}Content-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     )?;
     stream.write_all(body)?;
@@ -1366,18 +1845,25 @@ mod tests {
 
     const TEST_TOKEN: &str = "0123456789abcdef0123456789abcdef";
 
+    fn new_test_accounts() -> Arc<Mutex<accounts::AccountStore>> {
+        Arc::new(Mutex::new(accounts::AccountStore::new(None)))
+    }
+
     #[test]
     fn credentials_api_stores_returns_and_clears_plaintext_for_teacher() {
         let store = Arc::new(Mutex::new(RoomStore::new("ROOM-1".to_string(), None)));
+        let accounts = new_test_accounts();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
 
         let send_http = |req: String| -> String {
             let store_clone = Arc::clone(&store);
+            let accounts_clone = Arc::clone(&accounts);
             let mut client = TcpStream::connect(addr).unwrap();
             let (server_stream, _) = listener.accept().unwrap();
             let handle = std::thread::spawn(move || {
-                handle_connection(server_stream, &store_clone, TEST_TOKEN).unwrap();
+                handle_connection(server_stream, &store_clone, &accounts_clone, TEST_TOKEN)
+                    .unwrap();
             });
             client.write_all(req.as_bytes()).unwrap();
             let mut resp = String::new();
@@ -1535,10 +2021,11 @@ mod tests {
 
         // 1. Send two raw frames over a single keep-alive TCP connection.
         let store_post = Arc::clone(&store);
+        let accounts_post = new_test_accounts();
         let mut post_client = TcpStream::connect(addr).unwrap();
         let (post_server, _) = listener.accept().unwrap();
         let post_handle = std::thread::spawn(move || {
-            handle_connection(post_server, &store_post, TEST_TOKEN).unwrap();
+            handle_connection(post_server, &store_post, &accounts_post, TEST_TOKEN).unwrap();
         });
 
         let f1 = [0xffu8, 0xd8, 0x01, 0xff, 0xd9];
@@ -1585,10 +2072,11 @@ mod tests {
 
         // 2. Open GET /api/webcam-stream/erin, verify it streams the latest frame, then close on Exited.
         let store_stream = Arc::clone(&store);
+        let accounts_stream = new_test_accounts();
         let mut viewer = TcpStream::connect(addr).unwrap();
         let (stream_server, _) = listener.accept().unwrap();
         let stream_handle = std::thread::spawn(move || {
-            handle_connection(stream_server, &store_stream, TEST_TOKEN).unwrap();
+            handle_connection(stream_server, &store_stream, &accounts_stream, TEST_TOKEN).unwrap();
         });
 
         viewer
@@ -1651,10 +2139,11 @@ mod tests {
 
         // 1. Send two screen frames over keep-alive POST /api/screen-raw/frank (including >512 KiB).
         let store_post = Arc::clone(&store);
+        let accounts_post = new_test_accounts();
         let mut post_client = TcpStream::connect(addr).unwrap();
         let (post_server, _) = listener.accept().unwrap();
         let post_handle = std::thread::spawn(move || {
-            handle_connection(post_server, &store_post, TEST_TOKEN).unwrap();
+            handle_connection(post_server, &store_post, &accounts_post, TEST_TOKEN).unwrap();
         });
 
         let mut large_frame = vec![0x55u8; 600 * 1024];
@@ -1701,10 +2190,11 @@ mod tests {
 
         // 2. Open GET /api/screen-stream/frank, verify it streams s2, then closes on Exited.
         let store_stream = Arc::clone(&store);
+        let accounts_stream = new_test_accounts();
         let mut viewer = TcpStream::connect(addr).unwrap();
         let (stream_server, _) = listener.accept().unwrap();
         let stream_handle = std::thread::spawn(move || {
-            handle_connection(stream_server, &store_stream, TEST_TOKEN).unwrap();
+            handle_connection(stream_server, &store_stream, &accounts_stream, TEST_TOKEN).unwrap();
         });
 
         viewer
@@ -1758,15 +2248,18 @@ mod tests {
     #[test]
     fn admin_routes_require_proctor_auth_and_bootstrap_cookie_works() {
         let store = Arc::new(Mutex::new(RoomStore::new("ROOM-1".to_string(), None)));
+        let accounts = new_test_accounts();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
 
         let send_raw = |req: String| -> String {
             let store_clone = Arc::clone(&store);
+            let accounts_clone = Arc::clone(&accounts);
             let mut client = TcpStream::connect(addr).unwrap();
             let (server_stream, _) = listener.accept().unwrap();
             let handle = std::thread::spawn(move || {
-                handle_connection(server_stream, &store_clone, TEST_TOKEN).unwrap();
+                handle_connection(server_stream, &store_clone, &accounts_clone, TEST_TOKEN)
+                    .unwrap();
             });
             client.write_all(req.as_bytes()).unwrap();
             let mut resp = String::new();
@@ -1775,10 +2268,16 @@ mod tests {
             resp
         };
 
-        // Unauthenticated GET / returns 401 HTML.
+        // Unauthenticated GET / serves the sign-in dashboard HTML shell (200 OK).
         let r_root = send_raw("GET / HTTP/1.1\r\nHost: localhost\r\n\r\n".to_string());
-        assert!(r_root.starts_with("HTTP/1.1 401 Unauthorized"));
+        assert!(r_root.starts_with("HTTP/1.1 200 OK"));
         assert!(r_root.contains("text/html"));
+        assert!(r_root.contains("RLD Proctor"));
+
+        // Unauthenticated GET /api/state returns 401 JSON.
+        let r_state = send_raw("GET /api/state HTTP/1.1\r\nHost: localhost\r\n\r\n".to_string());
+        assert!(r_state.starts_with("HTTP/1.1 401 Unauthorized"));
+        assert!(r_state.ends_with(r#"{"error":"proctor authentication required"}"#));
 
         // Unauthenticated GET /api/credentials returns 401 JSON.
         let r_creds =
@@ -1791,6 +2290,15 @@ mod tests {
             send_raw("POST /api/unlock-all HTTP/1.1\r\nHost: localhost\r\n\r\n".to_string());
         assert!(r_unlock.starts_with("HTTP/1.1 401 Unauthorized"));
         assert!(r_unlock.ends_with(r#"{"error":"proctor authentication required"}"#));
+
+        // Unauthenticated GET /api/rooms and GET /ws/proctor return 401 JSON.
+        let r_rooms = send_raw("GET /api/rooms HTTP/1.1\r\nHost: localhost\r\n\r\n".to_string());
+        assert!(r_rooms.starts_with("HTTP/1.1 401 Unauthorized"));
+        let r_ws = send_raw(
+            "GET /ws/proctor HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n"
+                .to_string(),
+        );
+        assert!(r_ws.starts_with("HTTP/1.1 401 Unauthorized"));
 
         // Bootstrap GET /?token=<TEST_TOKEN> sets HttpOnly SameSite=Strict cookie and redirects.
         let r_boot = send_raw(format!(
@@ -1853,15 +2361,18 @@ mod tests {
     #[test]
     fn bounded_headers_and_connection_guard_enforce_limits() {
         let store = Arc::new(Mutex::new(RoomStore::new("ROOM-1".to_string(), None)));
+        let accounts = new_test_accounts();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
 
         let send_raw = |req: String| -> String {
             let store_clone = Arc::clone(&store);
+            let accounts_clone = Arc::clone(&accounts);
             let mut client = TcpStream::connect(addr).unwrap();
             let (server_stream, _) = listener.accept().unwrap();
             let handle = std::thread::spawn(move || {
-                handle_connection(server_stream, &store_clone, TEST_TOKEN).unwrap();
+                handle_connection(server_stream, &store_clone, &accounts_clone, TEST_TOKEN)
+                    .unwrap();
             });
             let _ = client.write_all(req.as_bytes());
             let mut resp = String::new();
@@ -1904,5 +2415,200 @@ mod tests {
     fn dashboard_esc_escapes_html_quotes() {
         let html = dashboard::dashboard_html();
         assert!(html.contains(r#".replace(/"/g,'&quot;').replace(/'/g,'&#39;')"#));
+    }
+
+    fn build_masked_ws_frame(opcode: u8, payload: &[u8]) -> Vec<u8> {
+        let mask = [0x12u8, 0x34, 0x56, 0x78];
+        let mut frame = Vec::new();
+        frame.push(0x80 | opcode);
+        assert!(payload.len() < 126);
+        frame.push(0x80 | (payload.len() as u8));
+        frame.extend_from_slice(&mask);
+        for (i, &b) in payload.iter().enumerate() {
+            frame.push(b ^ mask[i & 3]);
+        }
+        frame
+    }
+
+    #[test]
+    fn teacher_auth_rooms_and_multiplexed_ws_flow() {
+        let store = Arc::new(Mutex::new(RoomStore::new("ROOM-1".to_string(), None)));
+        let accounts = new_test_accounts();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let send_raw = |req: String| -> String {
+            let store_clone = Arc::clone(&store);
+            let accounts_clone = Arc::clone(&accounts);
+            let mut client = TcpStream::connect(addr).unwrap();
+            let (server_stream, _) = listener.accept().unwrap();
+            let handle = std::thread::spawn(move || {
+                handle_connection(server_stream, &store_clone, &accounts_clone, TEST_TOKEN)
+                    .unwrap();
+            });
+            client.write_all(req.as_bytes()).unwrap();
+            let mut resp = String::new();
+            client.read_to_string(&mut resp).unwrap();
+            handle.join().unwrap();
+            resp
+        };
+
+        // 1. Unauthenticated /api/auth/me reports authenticated=false, has_accounts=false.
+        let r_me0 = send_raw("GET /api/auth/me HTTP/1.1\r\nHost: localhost\r\n\r\n".to_string());
+        let me0: serde_json::Value =
+            serde_json::from_str(r_me0.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(me0["authenticated"], false);
+        assert_eq!(me0["has_accounts"], false);
+
+        // 2. Register teacher account -> 200 OK + Set-Cookie: rb_session=...
+        let reg_body = r#"{"name":"Ms. Hopper","email":"grace@school.edu","password":"password123"}"#;
+        let r_reg = send_raw(format!(
+            "POST /api/auth/register HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            reg_body.len(),
+            reg_body
+        ));
+        assert!(r_reg.starts_with("HTTP/1.1 200 OK"));
+        let session_cookie = r_reg
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("Set-Cookie: ")
+                    .and_then(|v| v.split(';').next())
+                    .filter(|c| c.starts_with("rb_session="))
+                    .map(str::to_string)
+            })
+            .expect("rb_session cookie returned on register");
+
+        // 3. Authenticated /api/auth/me returns teacher profile.
+        let r_me1 = send_raw(format!(
+            "GET /api/auth/me HTTP/1.1\r\nHost: localhost\r\nCookie: {session_cookie}\r\n\r\n"
+        ));
+        let me1: serde_json::Value =
+            serde_json::from_str(r_me1.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(me1["authenticated"], true);
+        assert_eq!(me1["teacher"]["email"], "grace@school.edu");
+        assert_eq!(me1["has_accounts"], true);
+
+        // 4. GET /api/rooms -> initially empty, active_room = ROOM-1.
+        let r_rooms0 = send_raw(format!(
+            "GET /api/rooms HTTP/1.1\r\nHost: localhost\r\nCookie: {session_cookie}\r\n\r\n"
+        ));
+        assert!(r_rooms0.starts_with("HTTP/1.1 200 OK"));
+        let rooms0: serde_json::Value =
+            serde_json::from_str(r_rooms0.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(rooms0["active_room"], "ROOM-1");
+        assert_eq!(rooms0["rooms"].as_array().unwrap().len(), 0);
+
+        // 5. POST /api/rooms -> creates room and switches active_room.
+        let create_body = r#"{"name":"AP CS Period 2","code":"k7m-92p"}"#;
+        let r_create = send_raw(format!(
+            "POST /api/rooms HTTP/1.1\r\nHost: localhost\r\nCookie: {session_cookie}\r\nContent-Length: {}\r\n\r\n{}",
+            create_body.len(),
+            create_body
+        ));
+        assert!(r_create.starts_with("HTTP/1.1 200 OK"));
+        let created: serde_json::Value =
+            serde_json::from_str(r_create.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(created["code"], "K7M-92P");
+        assert_eq!(created["name"], "AP CS Period 2");
+        assert_eq!(store.lock().unwrap().room_code, "K7M-92P");
+
+        // 6. GET /ws/proctor with rb_session cookie -> 101 handshake + multiplexed webcam & screen frames.
+        {
+            let mut guard = store.lock().unwrap();
+            guard.ingest_heartbeat(sample_hb("stu1", "k", vec![]));
+            guard.ingest_webcam_raw("stu1".to_string(), vec![0xff, 0xd8, 0x11, 0xff, 0xd9]);
+            guard.ingest_screen_raw("stu1", vec![0xff, 0xd8, 0x22, 0x33, 0xff, 0xd9]);
+        }
+
+        let store_ws = Arc::clone(&store);
+        let accounts_ws = Arc::clone(&accounts);
+        let mut ws_client = TcpStream::connect(addr).unwrap();
+        ws_client
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let (ws_server, _) = listener.accept().unwrap();
+        let ws_handle = std::thread::spawn(move || {
+            handle_connection(ws_server, &store_ws, &accounts_ws, TEST_TOKEN).unwrap();
+        });
+
+        ws_client
+            .write_all(
+                format!(
+                    "GET /ws/proctor HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nCookie: {session_cookie}\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+
+        let mut ws_reader = BufReader::new(ws_client.try_clone().unwrap());
+        let mut handshake = String::new();
+        loop {
+            let mut line = String::new();
+            ws_reader.read_line(&mut line).unwrap();
+            handshake.push_str(&line);
+            if line == "\r\n" {
+                break;
+            }
+        }
+        assert!(handshake.starts_with("HTTP/1.1 101 Switching Protocols"));
+        assert!(handshake.contains("Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo="));
+
+        // Send a focus message from client to server.
+        let focus_frame = build_masked_ws_frame(0x1, br#"{"type":"focus","student_id":"stu1"}"#);
+        ws_client.write_all(&focus_frame).unwrap();
+
+        // Read both webcam (kind=0) and screen (kind=1) binary frames.
+        let mut got_cam = false;
+        let mut got_screen = false;
+        for _ in 0..4 {
+            if let ws::WsIncoming::Binary(pkt) = ws::read_frame(&mut ws_reader, 64 * 1024).unwrap()
+            {
+                assert!(pkt.len() > 2);
+                let kind = pkt[0];
+                let id_len = pkt[1] as usize;
+                let sid = std::str::from_utf8(&pkt[2..2 + id_len]).unwrap();
+                let jpeg = &pkt[2 + id_len..];
+                assert_eq!(sid, "stu1");
+                if kind == ws::MEDIA_KIND_WEBCAM {
+                    assert_eq!(jpeg, &[0xff, 0xd8, 0x11, 0xff, 0xd9]);
+                    got_cam = true;
+                } else if kind == ws::MEDIA_KIND_SCREEN {
+                    assert_eq!(jpeg, &[0xff, 0xd8, 0x22, 0x33, 0xff, 0xd9]);
+                    got_screen = true;
+                }
+            }
+            if got_cam && got_screen {
+                break;
+            }
+        }
+        assert!(got_cam, "expected webcam binary frame over /ws/proctor");
+        assert!(got_screen, "expected screen binary frame over /ws/proctor");
+
+        // Close WebSocket cleanly.
+        let close_frame = build_masked_ws_frame(0x8, &[]);
+        ws_client.write_all(&close_frame).unwrap();
+        drop(ws_reader);
+        drop(ws_client);
+        ws_handle.join().unwrap();
+
+        // 7. DELETE /api/rooms/K7M-92P and POST /api/auth/logout.
+        let r_del = send_raw(format!(
+            "DELETE /api/rooms/K7M-92P HTTP/1.1\r\nHost: localhost\r\nCookie: {session_cookie}\r\n\r\n"
+        ));
+        assert!(r_del.starts_with("HTTP/1.1 200 OK"));
+        assert!(r_del.ends_with(r#"{"ok":true}"#));
+
+        let r_logout = send_raw(format!(
+            "POST /api/auth/logout HTTP/1.1\r\nHost: localhost\r\nCookie: {session_cookie}\r\n\r\n"
+        ));
+        assert!(r_logout.starts_with("HTTP/1.1 200 OK"));
+        assert!(r_logout.contains("Set-Cookie: rb_session=; Path=/; Max-Age=0"));
+
+        let r_me2 = send_raw(format!(
+            "GET /api/auth/me HTTP/1.1\r\nHost: localhost\r\nCookie: {session_cookie}\r\n\r\n"
+        ));
+        let me2: serde_json::Value =
+            serde_json::from_str(r_me2.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(me2["authenticated"], false);
     }
 }

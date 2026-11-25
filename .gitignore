@@ -1,5 +1,6 @@
 /target
 /dist
+rld-proctor-data.json
 .DS_Store
 *.swp
 *.swo
