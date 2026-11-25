@@ -218,6 +218,7 @@ fn send_exit_heartbeat(
     let hb = rustbrowser_core::StudentHeartbeat {
         student_id: student_id.to_string(),
         room_code: base_config.proctor.room_code.clone(),
+        join_token: base_config.proctor.join_token.clone(),
         exam_name: base_config.exam_name.clone(),
         config_key: config_key.to_string(),
         status: StudentStatus::Exited,
@@ -963,8 +964,11 @@ fn run_browser(config: ExamConfig, dev_mode: bool) -> ExitCode {
     let webcam_tx: Option<mpsc::SyncSender<String>> = proctor_server_url.clone().map(|url| {
         let (tx, rx) = mpsc::sync_channel::<String>(1);
         let sid = student_id.clone();
+        let room_code = config.proctor.room_code.clone();
+        let join_token = config.proctor.join_token.clone();
         std::thread::spawn(move || {
-            let mut uploader = proctor_client::WebcamUploader::new(url, sid);
+            let mut uploader =
+                proctor_client::WebcamUploader::new(url, sid).with_room(room_code, join_token);
             while let Ok(data_url) = rx.recv() {
                 uploader.send_frame(&data_url);
             }
@@ -975,9 +979,12 @@ fn run_browser(config: ExamConfig, dev_mode: bool) -> ExitCode {
     let screen_tx: Option<mpsc::SyncSender<Vec<u8>>> = proctor_server_url.clone().map(|url| {
         let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(1);
         let sid = student_id.clone();
+        let room_code = config.proctor.room_code.clone();
+        let join_token = config.proctor.join_token.clone();
         std::thread::spawn(move || {
             let mut uploader =
-                proctor_client::WebcamUploader::with_endpoint(url, sid, "/api/screen-raw/");
+                proctor_client::WebcamUploader::with_endpoint(url, sid, "/api/screen-raw/")
+                    .with_room(room_code, join_token);
             while let Ok(jpeg) = rx.recv() {
                 uploader.send_raw_jpeg(&jpeg);
             }
@@ -1010,6 +1017,7 @@ fn run_browser(config: ExamConfig, dev_mode: bool) -> ExitCode {
             proctor_client::HeartbeatConfig {
                 server_url,
                 room_code: config.proctor.room_code.clone(),
+                join_token: config.proctor.join_token.clone(),
                 student_id: student_id.clone(),
                 exam_name: config.exam_name.clone(),
                 config_key: config_key.clone(),

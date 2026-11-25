@@ -1,0 +1,19 @@
+# Replace proctor.example.com with your own domain name.
+# Caddy automatically provisions and renews Let's Encrypt TLS certificates,
+# negotiates HTTP/2 (and HTTP/3), and proxies WebSocket upgrades natively.
+proctor.example.com {
+	# Strict security headers
+	header {
+		Strict-Transport-Security "max-age=63072000; includeSubDomains; preload"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "no-referrer"
+		-Server
+	}
+
+	# Proxy to rld-proctor bound strictly to localhost
+	reverse_proxy 127.0.0.1:8443 {
+		header_up X-Forwarded-Proto https
+		header_up X-Real-IP {remote_host}
+	}
+}

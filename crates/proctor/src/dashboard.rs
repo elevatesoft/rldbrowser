@@ -1295,6 +1295,7 @@ pub fn dashboard_html() -> &'static str {
   let latestState = null;
   let latestCredentials = { entrance_code: null, quit_password: null };
   let latestRooms = { active_room: '', rooms: [] };
+  let activeRoomCode = '';
   let lastCamGridSig = '';
   let lastInspSig = '';
   let lastSettingsSig = '';
@@ -1307,7 +1308,10 @@ pub fn dashboard_html() -> &'static str {
   let pollTimer = null;
   let mediaWs = null;
   let wsReconnectTimer = null;
+  let mediaSweepTimer = null;
+  const FRAME_STALE_MS = 4000;
   const mediaUrls = new Map();
+  const mediaTimestamps = new Map();
   const wsDecoder = new TextDecoder();
   const credEyeVisible = { entrance: false, quit: false };
   const settingsDrafts = { entrance: '', quit: '', allowed: '' };
@@ -1318,6 +1322,7 @@ pub fn dashboard_html() -> &'static str {
 
   const esc = (s) => String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
   const isFlagged = (s) => !s.config_key_verified || (s.violations && s.violations.length > 0) || s.status === 'security_paused';
+  const roomQuery = () => activeRoomCode ? `?room=${encodeURIComponent(activeRoomCode)}` : '';
 
   const sendFocus = (studentId) => {
     if (mediaWs && mediaWs.readyState === WebSocket.OPEN) {
@@ -1335,10 +1340,49 @@ pub fn dashboard_html() -> &'static str {
     }
   };
 
+  const disposeMediaKey = (key) => {
+    const url = mediaUrls.get(key);
+    if (url) {
+      try { URL.revokeObjectURL(url); } catch (_) {}
+      mediaUrls.delete(key);
+    }
+    mediaTimestamps.delete(key);
+    const sep = key.indexOf(':');
+    if (sep === -1) return;
+    const kind = Number(key.slice(0, sep));
+    const studentId = key.slice(sep + 1);
+    const attr = kind === 0 ? 'data-cam-img' : 'data-screen-img';
+    document.querySelectorAll(`img[${attr}="${CSS.escape(studentId)}"]`).forEach((img) => {
+      img.removeAttribute('src');
+    });
+  };
+
+  const disposeStudentMedia = (studentId) => {
+    disposeMediaKey(`0:${studentId}`);
+    disposeMediaKey(`1:${studentId}`);
+  };
+
+  const sweepStaleMedia = () => {
+    const now = Date.now();
+    const staleKeys = [];
+    for (const [key, ts] of mediaTimestamps.entries()) {
+      if (now - ts > FRAME_STALE_MS) {
+        staleKeys.push(key);
+      }
+    }
+    for (const key of staleKeys) {
+      disposeMediaKey(key);
+    }
+  };
+
   const disconnectMediaWs = () => {
     if (wsReconnectTimer) {
       clearTimeout(wsReconnectTimer);
       wsReconnectTimer = null;
+    }
+    if (mediaSweepTimer) {
+      clearInterval(mediaSweepTimer);
+      mediaSweepTimer = null;
     }
     if (mediaWs) {
       const ws = mediaWs;
@@ -1348,10 +1392,11 @@ pub fn dashboard_html() -> &'static str {
       ws.onmessage = null;
       try { ws.close(); } catch (_) {}
     }
-    for (const url of mediaUrls.values()) {
-      try { URL.revokeObjectURL(url); } catch (_) {}
+    for (const key of Array.from(mediaUrls.keys())) {
+      disposeMediaKey(key);
     }
     mediaUrls.clear();
+    mediaTimestamps.clear();
   };
 
   const connectMediaWs = () => {
@@ -1360,11 +1405,14 @@ pub fn dashboard_html() -> &'static str {
       clearTimeout(wsReconnectTimer);
       wsReconnectTimer = null;
     }
+    if (!mediaSweepTimer) {
+      mediaSweepTimer = setInterval(sweepStaleMedia, 1000);
+    }
     if (mediaWs && (mediaWs.readyState === WebSocket.OPEN || mediaWs.readyState === WebSocket.CONNECTING)) {
       return;
     }
     const proto = location.protocol === 'https:' ? 'wss://' : 'ws://';
-    const ws = new WebSocket(proto + location.host + '/ws/proctor');
+    const ws = new WebSocket(proto + location.host + '/ws/proctor' + roomQuery());
     ws.binaryType = 'arraybuffer';
     mediaWs = ws;
 
@@ -1386,6 +1434,7 @@ pub fn dashboard_html() -> &'static str {
       const key = `${kind}:${studentId}`;
       const prevUrl = mediaUrls.get(key);
       mediaUrls.set(key, url);
+      mediaTimestamps.set(key, Date.now());
       const attr = kind === 0 ? 'data-cam-img' : 'data-screen-img';
       document.querySelectorAll(`img[${attr}="${CSS.escape(studentId)}"]`).forEach((img) => {
         img.src = url;
@@ -1408,6 +1457,11 @@ pub fn dashboard_html() -> &'static str {
     ws.onerror = () => {
       try { ws.close(); } catch (_) {}
     };
+  };
+
+  const reconnectMediaWs = () => {
+    disconnectMediaWs();
+    connectMediaWs();
   };
 
   const authView = document.getElementById('auth-view');
@@ -1533,6 +1587,7 @@ pub fn dashboard_html() -> &'static str {
     } catch (_) {}
     latestState = null;
     latestRooms = { active_room: '', rooms: [] };
+    activeRoomCode = '';
     lastCamGridSig = '';
     lastInspSig = '';
     lastSettingsSig = '';
@@ -1552,7 +1607,7 @@ pub fn dashboard_html() -> &'static str {
   };
 
   const unlockOne = async (studentId) => {
-    await fetch('/api/unlock', {
+    await fetch('/api/unlock' + roomQuery(), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ student_id: studentId }),
@@ -1595,7 +1650,7 @@ pub fn dashboard_html() -> &'static str {
       block_screen_capture_apps: true,
     };
     const next = Object.assign({}, base, patch);
-    await fetch('/api/policy', {
+    await fetch('/api/policy' + roomQuery(), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(next),
@@ -1604,7 +1659,7 @@ pub fn dashboard_html() -> &'static str {
   };
 
   const saveCredential = async (kind, value) => {
-    const res = await fetch('/api/credentials', {
+    const res = await fetch('/api/credentials' + roomQuery(), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ kind, value }),
@@ -1661,7 +1716,7 @@ pub fn dashboard_html() -> &'static str {
   document.getElementById('cancel-end-all').addEventListener('click', () => endModal.classList.remove('open'));
   document.getElementById('confirm-end-all').addEventListener('click', async () => {
     endModal.classList.remove('open');
-    await fetch('/api/unlock-all', { method: 'POST' });
+    await fetch('/api/unlock-all' + roomQuery(), { method: 'POST' });
     await refresh();
   });
 
@@ -1746,7 +1801,7 @@ pub fn dashboard_html() -> &'static str {
       lastCamGridSig = '';
       lastSettingsSig = '';
       const rooms = Array.isArray(latestRooms.rooms) ? latestRooms.rooms : [];
-      const activeRoom = latestRooms.active_room || (latestState && latestState.room_code) || '';
+      const activeRoom = activeRoomCode || latestRooms.active_room || (latestState && latestState.room_code) || '';
       const roomsSig = JSON.stringify([activeRoom, rooms, roomsError]);
       if (roomsSig === lastRoomsSig) {
         renderInspector();
@@ -1764,16 +1819,20 @@ pub fn dashboard_html() -> &'static str {
       const rowsHtml = rooms.length
         ? `<table>
             <thead><tr>
-              <th>Room</th><th>Code</th><th style="text-align:right">Actions</th>
+              <th>Room</th><th>Code</th><th>Join token</th><th style="text-align:right">Actions</th>
             </tr></thead>
             <tbody>${rooms.map((r) => {
               const isAct = r.code === activeRoom;
+              const joinTok = r.join_token || '';
+              const tokPreview = joinTok ? `${joinTok.slice(0, 8)}…` : '—';
               return `<tr class="${isAct ? 'selected' : ''}">
                 <td><strong>${esc(r.name)}</strong>${isAct ? ' <span class="dot dot-ok" style="margin-left:8px;margin-right:4px"></span><span class="muted" style="font-size:11.5px">Active</span>' : ''}</td>
                 <td class="mono">${esc(r.code)}</td>
+                <td class="mono muted" title="${esc(joinTok)}">${esc(tokPreview)}</td>
                 <td style="text-align:right">
                   <div class="room-actions">
-                    <button type="button" class="row-action" data-copy-rld="${esc(r.code)}">Copy rld:// link</button>
+                    ${joinTok ? `<button type="button" class="row-action" data-copy-token="${esc(joinTok)}">Copy join token</button>` : ''}
+                    <button type="button" class="row-action" data-copy-rld="${esc(r.code)}" data-copy-rld-token="${esc(joinTok)}">Copy rld:// link</button>
                     <button type="button" class="row-action primary" data-open-room="${esc(r.code)}">Open</button>
                     <button type="button" class="row-action danger" data-del-room="${esc(r.code)}">Delete</button>
                   </div>
@@ -1821,6 +1880,11 @@ pub fn dashboard_html() -> &'static str {
           return;
         }
         roomsDraftName = '';
+        if (data.code) {
+          activeRoomCode = data.code;
+          setSelectedId(null);
+          reconnectMediaWs();
+        }
         lastRoomsSig = '';
         await refresh(true);
       };
@@ -1828,10 +1892,23 @@ pub fn dashboard_html() -> &'static str {
       document.getElementById('create-room-btn').addEventListener('click', createRoom);
       nameInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') createRoom(); });
 
+      wrap.querySelectorAll('[data-copy-token]').forEach((btn) => {
+        btn.addEventListener('click', async () => {
+          const tok = btn.dataset.copyToken;
+          if (!tok) return;
+          try {
+            await navigator.clipboard.writeText(tok);
+            btn.textContent = 'Copied token';
+            setTimeout(() => { btn.textContent = 'Copy join token'; }, 1400);
+          } catch (_) {}
+        });
+      });
+
       wrap.querySelectorAll('[data-copy-rld]').forEach((btn) => {
         btn.addEventListener('click', async () => {
           const code = btn.dataset.copyRld;
-          const link = `rld://join?proctor=${encodeURIComponent(location.origin)}&room=${encodeURIComponent(code)}`;
+          const tok = btn.dataset.copyRldToken || '';
+          const link = `rld://join?proctor=${encodeURIComponent(location.origin)}&room=${encodeURIComponent(code)}${tok ? `&token=${encodeURIComponent(tok)}` : ''}`;
           try {
             await navigator.clipboard.writeText(link);
             btn.textContent = 'Copied link';
@@ -1848,7 +1925,13 @@ pub fn dashboard_html() -> &'static str {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ code }),
           });
+          activeRoomCode = code;
+          setSelectedId(null);
+          lastCamGridSig = '';
+          lastInspSig = '';
+          lastSettingsSig = '';
           lastRoomsSig = '';
+          reconnectMediaWs();
           await refresh(true);
           switchView('cameras');
         });
@@ -1858,6 +1941,11 @@ pub fn dashboard_html() -> &'static str {
         btn.addEventListener('click', async () => {
           const code = btn.dataset.delRoom;
           await fetch(`/api/rooms/${encodeURIComponent(code)}`, { method: 'DELETE' });
+          if (activeRoomCode === code) {
+            activeRoomCode = '';
+            setSelectedId(null);
+            reconnectMediaWs();
+          }
           lastRoomsSig = '';
           await refresh(true);
         });
@@ -2208,23 +2296,51 @@ pub fn dashboard_html() -> &'static str {
   const refresh = async (forceRender = false) => {
     if (!isAuthenticated) return;
     try {
+      const rq = roomQuery();
       const [res, credsRes, roomsRes] = await Promise.all([
-        fetch('/api/state'),
-        fetch('/api/credentials'),
-        fetch('/api/rooms'),
+        fetch('/api/state' + rq),
+        fetch('/api/credentials' + rq),
+        fetch('/api/rooms' + rq),
       ]);
       if (res.status === 401) {
         showAuthScreen(true);
         return;
       }
-      latestState = await res.json();
-      if (credsRes.ok) {
-        latestCredentials = await credsRes.json();
-      }
       if (roomsRes.ok) {
         latestRooms = await roomsRes.json();
       }
+      if (!res.ok) {
+        if (res.status === 403 && activeRoomCode) {
+          activeRoomCode = '';
+          reconnectMediaWs();
+        }
+        return;
+      }
+      latestState = await res.json();
+      if (!activeRoomCode && latestState && latestState.room_code) {
+        activeRoomCode = latestState.room_code;
+      }
+      if (credsRes.ok) {
+        latestCredentials = await credsRes.json();
+      }
       const students = latestState.students || [];
+      const activeIds = new Set();
+      for (const s of students) {
+        activeIds.add(s.student_id);
+        if (s.status === 'exited') {
+          disposeStudentMedia(s.student_id);
+        } else {
+          if (!s.has_webcam) disposeMediaKey(`0:${s.student_id}`);
+          if (!s.has_screen) disposeMediaKey(`1:${s.student_id}`);
+        }
+      }
+      for (const key of Array.from(mediaUrls.keys())) {
+        const sep = key.indexOf(':');
+        if (sep !== -1 && !activeIds.has(key.slice(sep + 1))) {
+          disposeMediaKey(key);
+        }
+      }
+      sweepStaleMedia();
       const camCount = students.filter((s) => s.status !== 'exited' && s.has_webcam).length;
 
       document.getElementById('room-label').textContent = latestState.room_code;

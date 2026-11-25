@@ -46,13 +46,82 @@ struct Cli {
     /// Path to persist teacher accounts and exam rooms JSON
     #[arg(long, default_value = "rld-proctor-data.json")]
     data: PathBuf,
+
+    /// Require a valid per-room join token on student telemetry endpoints (enable in cloud deployments)
+    #[arg(long, default_value_t = false)]
+    require_join_token: bool,
+
+    /// Optional static student join token override (accepted when --require-join-token is enabled)
+    #[arg(long)]
+    join_token: Option<String>,
+}
+
+const FRAME_TTL: Duration = Duration::from_secs(3);
+const NO_STORE_HEADERS: &str =
+    "Cache-Control: no-store, no-cache, must-revalidate, max-age=0\r\nPragma: no-cache\r\n";
+
+fn zeroize_vec(buf: &mut Vec<u8>) {
+    buf.fill(0);
+    buf.clear();
+}
+
+fn zeroize_opt_vec(opt: &mut Option<Vec<u8>>) {
+    if let Some(mut buf) = opt.take() {
+        zeroize_vec(&mut buf);
+    }
+}
+
+fn zeroize_opt_string(opt: &mut Option<String>) {
+    if let Some(s) = opt.take() {
+        let mut bytes = s.into_bytes();
+        zeroize_vec(&mut bytes);
+    }
 }
 
 #[derive(Debug, Default)]
 struct WebcamChannel {
     seq: u64,
     jpeg: Option<Vec<u8>>,
+    captured_at: Option<Instant>,
     closed: bool,
+}
+
+impl WebcamChannel {
+    fn replace_frame(&mut self, jpeg: Vec<u8>, now: Instant) {
+        zeroize_opt_vec(&mut self.jpeg);
+        self.seq = self.seq.wrapping_add(1).max(1);
+        self.jpeg = Some(jpeg);
+        self.captured_at = Some(now);
+        self.closed = false;
+    }
+
+    fn clear_frame(&mut self) {
+        zeroize_opt_vec(&mut self.jpeg);
+        self.captured_at = None;
+    }
+
+    fn is_fresh(&self, now: Instant) -> bool {
+        self.jpeg.is_some()
+            && self
+                .captured_at
+                .is_some_and(|ts| now.saturating_duration_since(ts) <= FRAME_TTL)
+    }
+
+    fn purge_if_expired(&mut self, now: Instant) {
+        if self.jpeg.is_some()
+            && self
+                .captured_at
+                .is_none_or(|ts| now.saturating_duration_since(ts) > FRAME_TTL)
+        {
+            self.clear_frame();
+        }
+    }
+}
+
+impl Drop for WebcamChannel {
+    fn drop(&mut self) {
+        self.clear_frame();
+    }
 }
 
 type SharedWebcamChannel = Arc<(Mutex<WebcamChannel>, Condvar)>;
@@ -72,8 +141,16 @@ struct StudentRecord {
     last_seen: Instant,
     force_unlock: bool,
     webcam_data_url: Option<String>,
+    webcam_data_url_at: Option<Instant>,
     webcam_channel: SharedWebcamChannel,
     screen_channel: SharedWebcamChannel,
+}
+
+impl Drop for StudentRecord {
+    fn drop(&mut self) {
+        zeroize_opt_string(&mut self.webcam_data_url);
+        self.webcam_data_url_at = None;
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -140,7 +217,38 @@ impl RoomStore {
         self.policy = policy;
     }
 
+    pub fn purge_expired_frames(&mut self) {
+        let now = Instant::now();
+        for rec in self.students.values_mut() {
+            if rec.webcam_data_url.is_some()
+                && rec
+                    .webcam_data_url_at
+                    .is_none_or(|ts| now.saturating_duration_since(ts) > FRAME_TTL)
+            {
+                zeroize_opt_string(&mut rec.webcam_data_url);
+                rec.webcam_data_url_at = None;
+            }
+            {
+                let mut ch = rec
+                    .webcam_channel
+                    .0
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                ch.purge_if_expired(now);
+            }
+            {
+                let mut ch = rec
+                    .screen_channel
+                    .0
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                ch.purge_if_expired(now);
+            }
+        }
+    }
+
     pub fn ingest_heartbeat(&mut self, mut hb: StudentHeartbeat) -> HeartbeatResponse {
+        self.purge_expired_frames();
         hb.student_id = sanitize_student_id(&hb.student_id);
         hb.violations = sanitize_violations(hb.violations);
 
@@ -170,6 +278,7 @@ impl RoomStore {
                 last_seen: Instant::now(),
                 force_unlock: false,
                 webcam_data_url: None,
+                webcam_data_url_at: None,
                 webcam_channel: new_webcam_channel(),
                 screen_channel: new_webcam_channel(),
             });
@@ -192,14 +301,15 @@ impl RoomStore {
         };
 
         if entry.status == StudentStatus::Exited {
-            entry.webcam_data_url = None;
+            zeroize_opt_string(&mut entry.webcam_data_url);
+            entry.webcam_data_url_at = None;
             {
                 let mut ch = entry
                     .webcam_channel
                     .0
                     .lock()
                     .unwrap_or_else(|e| e.into_inner());
-                ch.jpeg = None;
+                ch.clear_frame();
                 ch.closed = true;
                 entry.webcam_channel.1.notify_all();
             }
@@ -209,7 +319,7 @@ impl RoomStore {
                     .0
                     .lock()
                     .unwrap_or_else(|e| e.into_inner());
-                ch.jpeg = None;
+                ch.clear_frame();
                 ch.closed = true;
                 entry.screen_channel.1.notify_all();
             }
@@ -240,9 +350,13 @@ impl RoomStore {
         if !upload.data_url.starts_with("data:image/jpeg;base64,")
             && !upload.data_url.starts_with("data:image/webp;base64,")
         {
+            let mut bytes = upload.data_url.into_bytes();
+            zeroize_vec(&mut bytes);
             return false;
         }
         if !self.students.contains_key(&upload.student_id) && self.students.len() >= MAX_STUDENTS {
+            let mut bytes = upload.data_url.into_bytes();
+            zeroize_vec(&mut bytes);
             return false;
         }
         if self
@@ -250,9 +364,12 @@ impl RoomStore {
             .get(&upload.student_id)
             .is_some_and(|rec| rec.status == StudentStatus::Exited)
         {
+            let mut bytes = upload.data_url.into_bytes();
+            zeroize_vec(&mut bytes);
             return false;
         }
         let decoded_jpeg = decode_base64_jpeg(&upload.data_url);
+        let now = Instant::now();
         let entry = self
             .students
             .entry(upload.student_id)
@@ -263,34 +380,36 @@ impl RoomStore {
                 status: StudentStatus::InExam,
                 active_host: String::new(),
                 violations: Vec::new(),
-                last_seen: Instant::now(),
+                last_seen: now,
                 force_unlock: false,
                 webcam_data_url: None,
+                webcam_data_url_at: None,
                 webcam_channel: new_webcam_channel(),
                 screen_channel: new_webcam_channel(),
             });
+        zeroize_opt_string(&mut entry.webcam_data_url);
         entry.webcam_data_url = Some(upload.data_url);
+        entry.webcam_data_url_at = Some(now);
         if let Some(jpeg_bytes) = decoded_jpeg {
             let mut ch = entry
                 .webcam_channel
                 .0
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            ch.seq = ch.seq.wrapping_add(1).max(1);
-            ch.jpeg = Some(jpeg_bytes);
-            ch.closed = false;
+            ch.replace_frame(jpeg_bytes, now);
             entry.webcam_channel.1.notify_all();
         }
-        entry.last_seen = Instant::now();
+        entry.last_seen = now;
         true
     }
 
-    pub fn ingest_webcam_raw(&mut self, student_id: String, jpeg_bytes: Vec<u8>) -> bool {
+    pub fn ingest_webcam_raw(&mut self, student_id: String, mut jpeg_bytes: Vec<u8>) -> bool {
         let student_id = sanitize_student_id(&student_id);
         if jpeg_bytes.is_empty() {
             return false;
         }
         if !self.students.contains_key(&student_id) && self.students.len() >= MAX_STUDENTS {
+            zeroize_vec(&mut jpeg_bytes);
             return false;
         }
         if self
@@ -298,8 +417,10 @@ impl RoomStore {
             .get(&student_id)
             .is_some_and(|rec| rec.status == StudentStatus::Exited)
         {
+            zeroize_vec(&mut jpeg_bytes);
             return false;
         }
+        let now = Instant::now();
         let entry = self
             .students
             .entry(student_id)
@@ -310,9 +431,10 @@ impl RoomStore {
                 status: StudentStatus::InExam,
                 active_host: String::new(),
                 violations: Vec::new(),
-                last_seen: Instant::now(),
+                last_seen: now,
                 force_unlock: false,
                 webcam_data_url: None,
+                webcam_data_url_at: None,
                 webcam_channel: new_webcam_channel(),
                 screen_channel: new_webcam_channel(),
             });
@@ -322,12 +444,10 @@ impl RoomStore {
                 .0
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            ch.seq = ch.seq.wrapping_add(1).max(1);
-            ch.jpeg = Some(jpeg_bytes);
-            ch.closed = false;
+            ch.replace_frame(jpeg_bytes, now);
             entry.webcam_channel.1.notify_all();
         }
-        entry.last_seen = Instant::now();
+        entry.last_seen = now;
         true
     }
 
@@ -337,12 +457,13 @@ impl RoomStore {
             .map(|r| Arc::clone(&r.webcam_channel))
     }
 
-    pub fn ingest_screen_raw(&mut self, student_id: &str, jpeg: Vec<u8>) -> bool {
+    pub fn ingest_screen_raw(&mut self, student_id: &str, mut jpeg: Vec<u8>) -> bool {
         let student_id = sanitize_student_id(student_id);
         if jpeg.is_empty() {
             return false;
         }
         if !self.students.contains_key(&student_id) && self.students.len() >= MAX_STUDENTS {
+            zeroize_vec(&mut jpeg);
             return false;
         }
         if self
@@ -350,8 +471,10 @@ impl RoomStore {
             .get(&student_id)
             .is_some_and(|rec| rec.status == StudentStatus::Exited)
         {
+            zeroize_vec(&mut jpeg);
             return false;
         }
+        let now = Instant::now();
         let entry = self
             .students
             .entry(student_id)
@@ -362,9 +485,10 @@ impl RoomStore {
                 status: StudentStatus::InExam,
                 active_host: String::new(),
                 violations: Vec::new(),
-                last_seen: Instant::now(),
+                last_seen: now,
                 force_unlock: false,
                 webcam_data_url: None,
+                webcam_data_url_at: None,
                 webcam_channel: new_webcam_channel(),
                 screen_channel: new_webcam_channel(),
             });
@@ -374,12 +498,10 @@ impl RoomStore {
                 .0
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            ch.seq = ch.seq.wrapping_add(1).max(1);
-            ch.jpeg = Some(jpeg);
-            ch.closed = false;
+            ch.replace_frame(jpeg, now);
             entry.screen_channel.1.notify_all();
         }
-        entry.last_seen = Instant::now();
+        entry.last_seen = now;
         true
     }
 
@@ -390,9 +512,17 @@ impl RoomStore {
     }
 
     pub fn get_webcam(&self, student_id: &str) -> Option<&str> {
-        self.students
-            .get(student_id)
-            .and_then(|r| r.webcam_data_url.as_deref())
+        let now = Instant::now();
+        self.students.get(student_id).and_then(|r| {
+            let fresh = r
+                .webcam_data_url_at
+                .is_some_and(|ts| now.saturating_duration_since(ts) <= FRAME_TTL);
+            if fresh {
+                r.webcam_data_url.as_deref()
+            } else {
+                None
+            }
+        })
     }
 
     pub fn unlock_student(&mut self, student_id: &str) -> bool {
@@ -412,7 +542,8 @@ impl RoomStore {
         }
     }
 
-    pub fn snapshot(&self) -> RoomStateSnapshot {
+    pub fn snapshot(&mut self) -> RoomStateSnapshot {
+        self.purge_expired_frames();
         let now = Instant::now();
         let mut in_exam_count = 0usize;
         let mut flagged_count = 0usize;
@@ -428,6 +559,23 @@ impl RoomStore {
             {
                 flagged_count += 1;
             }
+            let has_fresh_data_url = rec.webcam_data_url.is_some()
+                && rec
+                    .webcam_data_url_at
+                    .is_some_and(|ts| now.saturating_duration_since(ts) <= FRAME_TTL);
+            let has_fresh_webcam = has_fresh_data_url
+                || rec
+                    .webcam_channel
+                    .0
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .is_fresh(now);
+            let has_fresh_screen = rec
+                .screen_channel
+                .0
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_fresh(now);
             students.push(RoomStudentView {
                 student_id: id.clone(),
                 exam_name: rec.exam_name.clone(),
@@ -438,21 +586,8 @@ impl RoomStore {
                 violations: rec.violations.clone(),
                 last_seen_secs_ago: now.saturating_duration_since(rec.last_seen).as_secs(),
                 force_unlock_pending: rec.force_unlock,
-                has_webcam: rec.webcam_data_url.is_some()
-                    || rec
-                        .webcam_channel
-                        .0
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .jpeg
-                        .is_some(),
-                has_screen: rec
-                    .screen_channel
-                    .0
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .jpeg
-                    .is_some(),
+                has_webcam: has_fresh_webcam,
+                has_screen: has_fresh_screen,
             });
         }
 
@@ -466,6 +601,104 @@ impl RoomStore {
             students,
         }
     }
+}
+
+#[derive(Debug)]
+pub struct RoomRegistry {
+    default_room: String,
+    expected_config_key: Option<String>,
+    default_policy: Option<RoomPolicyOverrides>,
+    rooms: BTreeMap<String, Arc<Mutex<RoomStore>>>,
+}
+
+impl RoomRegistry {
+    pub fn new(
+        default_room: String,
+        expected_config_key: Option<String>,
+        default_policy: Option<RoomPolicyOverrides>,
+    ) -> Self {
+        let normalized_default = normalize_room_code(Some(&default_room), "DEFAULT");
+        let mut initial = RoomStore::new(normalized_default.clone(), expected_config_key.clone());
+        if let Some(ref policy) = default_policy {
+            initial.set_policy(policy.clone());
+        }
+        let mut rooms = BTreeMap::new();
+        rooms.insert(normalized_default.clone(), Arc::new(Mutex::new(initial)));
+        Self {
+            default_room: normalized_default,
+            expected_config_key,
+            default_policy,
+            rooms,
+        }
+    }
+
+    pub fn default_room(&self) -> &str {
+        &self.default_room
+    }
+
+    pub fn get_or_create(&mut self, room_code: &str) -> Arc<Mutex<RoomStore>> {
+        let key = normalize_room_code(Some(room_code), &self.default_room);
+        if let Some(existing) = self.rooms.get(&key) {
+            return Arc::clone(existing);
+        }
+        let mut store = RoomStore::new(key.clone(), self.expected_config_key.clone());
+        if let Some(ref policy) = self.default_policy {
+            store.set_policy(policy.clone());
+        }
+        let arc = Arc::new(Mutex::new(store));
+        self.rooms.insert(key, Arc::clone(&arc));
+        arc
+    }
+
+    pub fn remove(&mut self, room_code: &str) {
+        let key = normalize_room_code(Some(room_code), &self.default_room);
+        if key != self.default_room {
+            self.rooms.remove(&key);
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ServerConfig {
+    proctor_token: String,
+    require_join_token: bool,
+    cli_join_token: Option<String>,
+}
+
+const AUTH_RATE_LIMIT_MAX_ATTEMPTS: usize = 10;
+const AUTH_RATE_LIMIT_WINDOW: Duration = Duration::from_secs(60);
+
+#[derive(Debug, Default)]
+struct AuthRateLimiter {
+    attempts: Mutex<BTreeMap<String, Vec<Instant>>>,
+}
+
+impl AuthRateLimiter {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn check_and_record(&self, client_ip: &str) -> bool {
+        let now = Instant::now();
+        let mut map = self.attempts.lock().unwrap_or_else(|e| e.into_inner());
+        let entries = map.entry(client_ip.to_string()).or_default();
+        entries.retain(|ts| now.saturating_duration_since(*ts) < AUTH_RATE_LIMIT_WINDOW);
+        if entries.len() >= AUTH_RATE_LIMIT_MAX_ATTEMPTS {
+            return false;
+        }
+        entries.push(now);
+        true
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct IncomingWebcamUpload {
+    #[serde(flatten)]
+    upload: WebcamFrameUpload,
+    #[serde(default)]
+    room_code: Option<String>,
+    #[serde(default)]
+    join_token: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -664,12 +897,118 @@ fn read_bounded_line<R: BufRead>(
     }
 }
 
+fn normalize_room_code(raw: Option<&str>, default_room: &str) -> String {
+    raw.map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_ascii_uppercase)
+        .unwrap_or_else(|| default_room.trim().to_ascii_uppercase())
+}
+
+fn extract_client_ip(
+    stream: &TcpStream,
+    x_real_ip: Option<&str>,
+    x_forwarded_for: Option<&str>,
+) -> String {
+    let peer_ip = stream.peer_addr().ok().map(|a| a.ip());
+    if peer_ip.is_some_and(|ip| ip.is_loopback()) {
+        if let Some(real_ip) = x_real_ip.map(str::trim).filter(|s| !s.is_empty()) {
+            return real_ip.to_string();
+        }
+        if let Some(first_fwd) = x_forwarded_for
+            .and_then(|v| v.split(',').next())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            return first_fwd.to_string();
+        }
+    }
+    peer_ip
+        .map(|ip| ip.to_string())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn is_teacher_authorized_for_room(
+    token_auth: bool,
+    teacher: Option<&accounts::TeacherPublicView>,
+    room_code: &str,
+    default_room: &str,
+    accounts: &Arc<Mutex<accounts::AccountStore>>,
+) -> bool {
+    if token_auth {
+        return true;
+    }
+    let Some(teacher) = teacher else {
+        return false;
+    };
+    let guard = accounts.lock().unwrap_or_else(|e| e.into_inner());
+    if guard.is_room_owner(&teacher.id, room_code) {
+        return true;
+    }
+    // If another teacher owns this room, deny access.
+    if guard.get_room(room_code).is_some() {
+        return false;
+    }
+    // Allow accessing the unclaimed CLI default room (e.g. before a teacher creates their first room).
+    room_code.eq_ignore_ascii_case(default_room)
+}
+
+fn verify_student_join_token(
+    config: &ServerConfig,
+    accounts: &Arc<Mutex<accounts::AccountStore>>,
+    room_code: &str,
+    provided_token: Option<&str>,
+) -> bool {
+    if !config.require_join_token {
+        return true;
+    }
+    let Some(tok) = provided_token.map(str::trim).filter(|t| !t.is_empty()) else {
+        return false;
+    };
+    if let Some(cli_tok) = config.cli_join_token.as_deref().filter(|t| !t.is_empty())
+        && constant_time_eq(tok.as_bytes(), cli_tok.as_bytes())
+    {
+        return true;
+    }
+    accounts
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .verify_join_token(room_code, tok)
+}
+
 fn write_unauthorized_api(stream: &mut TcpStream) -> std::io::Result<()> {
     write_response(
         stream,
         "401 Unauthorized",
         "application/json",
         br#"{"error":"proctor authentication required"}"#,
+    )
+}
+
+fn write_unauthorized_join_token(stream: &mut TcpStream) -> std::io::Result<()> {
+    write_response(
+        stream,
+        "401 Unauthorized",
+        "application/json",
+        br#"{"error":"valid room join token required"}"#,
+    )
+}
+
+fn write_forbidden_room(stream: &mut TcpStream) -> std::io::Result<()> {
+    write_response(
+        stream,
+        "403 Forbidden",
+        "application/json",
+        br#"{"error":"forbidden: room belongs to another teacher"}"#,
+    )
+}
+
+fn write_rate_limited(stream: &mut TcpStream) -> std::io::Result<()> {
+    write_response_with_headers(
+        stream,
+        "429 Too Many Requests",
+        "application/json",
+        "Retry-After: 60\r\n",
+        br#"{"error":"too many authentication attempts, please retry later"}"#,
     )
 }
 
@@ -731,13 +1070,19 @@ fn main() -> ExitCode {
         println!("  Teacher LAN URL:   http://{lan_ip}:{port}/?token={proctor_token}");
     }
 
-    let mut initial_store = RoomStore::new(cli.room, expected_key);
-    if let Some(cfg) = &loaded_config {
-        initial_store.set_policy(RoomStore::policy_from_config(cfg));
-    }
-    let store = Arc::new(Mutex::new(initial_store));
+    let default_policy = loaded_config.as_ref().map(RoomStore::policy_from_config);
+    let registry = Arc::new(Mutex::new(RoomRegistry::new(
+        cli.room,
+        expected_key,
+        default_policy,
+    )));
     let accounts = Arc::new(Mutex::new(accounts::AccountStore::new(Some(cli.data))));
-    let token = Arc::new(proctor_token);
+    let rate_limiter = Arc::new(AuthRateLimiter::new());
+    let config = Arc::new(ServerConfig {
+        proctor_token,
+        require_join_token: cli.require_join_token,
+        cli_join_token: cli.join_token.filter(|t| !t.trim().is_empty()),
+    });
     let active_connections = Arc::new(AtomicUsize::new(0));
 
     for mut stream in listener.incoming().flatten() {
@@ -751,12 +1096,13 @@ fn main() -> ExitCode {
             );
             continue;
         };
-        let store = Arc::clone(&store);
+        let registry = Arc::clone(&registry);
         let accounts = Arc::clone(&accounts);
-        let token = Arc::clone(&token);
+        let rate_limiter = Arc::clone(&rate_limiter);
+        let config = Arc::clone(&config);
         std::thread::spawn(move || {
             let _guard = guard;
-            let _ = handle_connection(stream, &store, &accounts, &token);
+            let _ = handle_connection(stream, &registry, &accounts, &rate_limiter, &config);
         });
     }
 
@@ -765,10 +1111,12 @@ fn main() -> ExitCode {
 
 fn handle_connection(
     mut stream: TcpStream,
-    store: &Arc<Mutex<RoomStore>>,
+    registry: &Arc<Mutex<RoomRegistry>>,
     accounts: &Arc<Mutex<accounts::AccountStore>>,
-    proctor_token: &str,
+    rate_limiter: &Arc<AuthRateLimiter>,
+    config: &ServerConfig,
 ) -> std::io::Result<()> {
+    let proctor_token = config.proctor_token.as_str();
     let _ = stream.set_nodelay(true);
     let _ = stream.set_read_timeout(Some(CONNECTION_IO_TIMEOUT));
     let _ = stream.set_write_timeout(Some(CONNECTION_IO_TIMEOUT));
@@ -813,8 +1161,13 @@ fn handle_connection(
         let mut body_too_large = false;
         let mut token_auth = false;
         let mut session_token: Option<String> = None;
+        let mut forwarded_https = false;
         let mut upgrade_websocket = false;
         let mut ws_key: Option<String> = None;
+        let mut header_room_code: Option<String> = None;
+        let mut header_room_token: Option<String> = None;
+        let mut header_real_ip: Option<String> = None;
+        let mut header_forwarded_for: Option<String> = None;
         let mut header_count = 0usize;
         loop {
             let line = match read_bounded_line(&mut reader, MAX_HEADER_LINE_BYTES) {
@@ -863,6 +1216,22 @@ fn handle_connection(
                     upgrade_websocket = true;
                 } else if name.eq_ignore_ascii_case("sec-websocket-key") && !val.is_empty() {
                     ws_key = Some(val.to_string());
+                } else if name.eq_ignore_ascii_case("x-forwarded-proto") {
+                    if val
+                        .split(',')
+                        .next()
+                        .is_some_and(|p| p.trim().eq_ignore_ascii_case("https"))
+                    {
+                        forwarded_https = true;
+                    }
+                } else if name.eq_ignore_ascii_case("x-real-ip") && !val.is_empty() {
+                    header_real_ip = Some(val.to_string());
+                } else if name.eq_ignore_ascii_case("x-forwarded-for") && !val.is_empty() {
+                    header_forwarded_for = Some(val.to_string());
+                } else if name.eq_ignore_ascii_case("x-room-code") && !val.is_empty() {
+                    header_room_code = Some(val.to_string());
+                } else if name.eq_ignore_ascii_case("x-room-token") && !val.is_empty() {
+                    header_room_token = Some(val.to_string());
                 } else if name.eq_ignore_ascii_case("x-proctor-token")
                     && constant_time_eq(val.as_bytes(), proctor_token.as_bytes())
                 {
@@ -905,15 +1274,28 @@ fn handle_connection(
             .as_ref()
             .map(|t| t.id.as_str())
             .unwrap_or("local-proctor");
+        let secure_attr = if forwarded_https { "; Secure" } else { "" };
+        let default_room = registry
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .default_room()
+            .to_string();
+        let query_room = query.and_then(|q| extract_query_param(q, "room"));
+        let query_token = query.and_then(|q| extract_query_param(q, "token"));
+        let admin_room = normalize_room_code(query_room.as_deref(), &default_room);
+        let client_ip = extract_client_ip(
+            &stream,
+            header_real_ip.as_deref(),
+            header_forwarded_for.as_deref(),
+        );
 
         if method == "GET"
             && path == "/"
-            && let Some(q) = query
-            && let Some(tok) = extract_query_param(q, "token")
+            && let Some(tok) = query_token.as_deref()
             && constant_time_eq(tok.as_bytes(), proctor_token.as_bytes())
         {
             let resp = format!(
-                "HTTP/1.1 302 Found\r\nLocation: /\r\nSet-Cookie: rb_proctor={proctor_token}; Path=/; HttpOnly; SameSite=Strict\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                "HTTP/1.1 302 Found\r\nLocation: /\r\nSet-Cookie: rb_proctor={proctor_token}; Path=/; HttpOnly; SameSite=Strict{secure_attr}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
             );
             stream.write_all(resp.as_bytes())?;
             return stream.flush();
@@ -922,8 +1304,20 @@ fn handle_connection(
         if method == "POST"
             && let Some(student_id) = path.strip_prefix("/api/webcam-raw/")
         {
+            let target_room = normalize_room_code(
+                header_room_code.as_deref().or(query_room.as_deref()),
+                &default_room,
+            );
+            let provided_token = header_room_token.as_deref().or(query_token.as_deref());
+            if !verify_student_join_token(config, accounts, &target_room, provided_token) {
+                return write_unauthorized_join_token(&mut stream);
+            }
             let decoded_id = percent_decode(student_id);
-            store
+            let room_store = registry
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get_or_create(&target_room);
+            room_store
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .ingest_webcam_raw(decoded_id, body);
@@ -946,8 +1340,21 @@ fn handle_connection(
             if !authenticated {
                 return write_unauthorized_api(&mut stream);
             }
+            if !is_teacher_authorized_for_room(
+                token_auth,
+                teacher.as_ref(),
+                &admin_room,
+                &default_room,
+                accounts,
+            ) {
+                return write_forbidden_room(&mut stream);
+            }
             let decoded_id = percent_decode(student_id);
-            let channel = store
+            let room_store = registry
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get_or_create(&admin_room);
+            let channel = room_store
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .webcam_channel(&decoded_id);
@@ -965,8 +1372,20 @@ fn handle_connection(
         if method == "POST"
             && let Some(student_id) = path.strip_prefix("/api/screen-raw/")
         {
+            let target_room = normalize_room_code(
+                header_room_code.as_deref().or(query_room.as_deref()),
+                &default_room,
+            );
+            let provided_token = header_room_token.as_deref().or(query_token.as_deref());
+            if !verify_student_join_token(config, accounts, &target_room, provided_token) {
+                return write_unauthorized_join_token(&mut stream);
+            }
             let decoded_id = percent_decode(student_id);
-            store
+            let room_store = registry
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get_or_create(&target_room);
+            room_store
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .ingest_screen_raw(&decoded_id, body);
@@ -989,8 +1408,21 @@ fn handle_connection(
             if !authenticated {
                 return write_unauthorized_api(&mut stream);
             }
+            if !is_teacher_authorized_for_room(
+                token_auth,
+                teacher.as_ref(),
+                &admin_room,
+                &default_room,
+                accounts,
+            ) {
+                return write_forbidden_room(&mut stream);
+            }
             let decoded_id = percent_decode(student_id);
-            let channel = store
+            let room_store = registry
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get_or_create(&admin_room);
+            let channel = room_store
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .screen_channel(&decoded_id);
@@ -1011,17 +1443,31 @@ fn handle_connection(
             if !authenticated {
                 return write_unauthorized_api(&mut stream);
             }
+            if !is_teacher_authorized_for_room(
+                token_auth,
+                teacher.as_ref(),
+                &admin_room,
+                &default_room,
+                accounts,
+            ) {
+                return write_forbidden_room(&mut stream);
+            }
             let decoded_id = percent_decode(student_id);
-            let frame = store
+            let room_store = registry
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .get_webcam(&decoded_id)
-                .map(str::to_string);
+                .get_or_create(&admin_room);
+            let frame = {
+                let mut guard = room_store.lock().unwrap_or_else(|e| e.into_inner());
+                guard.purge_expired_frames();
+                guard.get_webcam(&decoded_id).map(str::to_string)
+            };
             let payload = serde_json::json!({ "data_url": frame }).to_string();
-            return write_response(
+            return write_response_with_headers(
                 &mut stream,
                 "200 OK",
                 "application/json",
+                NO_STORE_HEADERS,
                 payload.as_bytes(),
             );
         }
@@ -1037,6 +1483,12 @@ fn handle_connection(
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .delete_room(owner_id, &decoded_code);
+            if ok {
+                registry
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&decoded_code);
+            }
             let payload = serde_json::json!({ "ok": ok }).to_string();
             return write_response(
                 &mut stream,
@@ -1057,6 +1509,15 @@ fn handle_connection(
                 if !authenticated {
                     return write_unauthorized_api(&mut stream);
                 }
+                if !is_teacher_authorized_for_room(
+                    token_auth,
+                    teacher.as_ref(),
+                    &admin_room,
+                    &default_room,
+                    accounts,
+                ) {
+                    return write_forbidden_room(&mut stream);
+                }
                 if !upgrade_websocket {
                     return write_response(
                         &mut stream,
@@ -1073,8 +1534,12 @@ fn handle_connection(
                         br#"{"error":"missing Sec-WebSocket-Key"}"#,
                     );
                 };
+                let room_store = registry
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get_or_create(&admin_room);
                 drop(reader);
-                serve_proctor_ws(stream, store, &key)
+                serve_proctor_ws(stream, &room_store, &key)
             }
             ("GET", "/api/auth/me") => {
                 let has_accounts = accounts
@@ -1091,6 +1556,9 @@ fn handle_connection(
                 write_response(&mut stream, "200 OK", "application/json", payload.as_bytes())
             }
             ("POST", "/api/auth/register") => {
+                if !rate_limiter.check_and_record(&client_ip) {
+                    return write_rate_limited(&mut stream);
+                }
                 match serde_json::from_slice::<RegisterRequest>(&body) {
                     Ok(req) => {
                         let res = accounts
@@ -1101,7 +1569,7 @@ fn handle_connection(
                             Ok((view, sess_tok)) => {
                                 let payload = serde_json::json!({ "teacher": view }).to_string();
                                 let cookie = format!(
-                                    "Set-Cookie: rb_session={sess_tok}; Path=/; HttpOnly; SameSite=Strict\r\n"
+                                    "Set-Cookie: rb_session={sess_tok}; Path=/; HttpOnly; SameSite=Strict{secure_attr}\r\n"
                                 );
                                 write_response_with_headers(
                                     &mut stream,
@@ -1130,44 +1598,49 @@ fn handle_connection(
                     ),
                 }
             }
-            ("POST", "/api/auth/login") => match serde_json::from_slice::<LoginRequest>(&body) {
-                Ok(req) => {
-                    let res = accounts
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .login(&req.email, &req.password);
-                    match res {
-                        Ok((view, sess_tok)) => {
-                            let payload = serde_json::json!({ "teacher": view }).to_string();
-                            let cookie = format!(
-                                "Set-Cookie: rb_session={sess_tok}; Path=/; HttpOnly; SameSite=Strict\r\n"
-                            );
-                            write_response_with_headers(
-                                &mut stream,
-                                "200 OK",
-                                "application/json",
-                                &cookie,
-                                payload.as_bytes(),
-                            )
-                        }
-                        Err(err) => {
-                            let payload = serde_json::json!({ "error": err }).to_string();
-                            write_response(
-                                &mut stream,
-                                "401 Unauthorized",
-                                "application/json",
-                                payload.as_bytes(),
-                            )
+            ("POST", "/api/auth/login") => {
+                if !rate_limiter.check_and_record(&client_ip) {
+                    return write_rate_limited(&mut stream);
+                }
+                match serde_json::from_slice::<LoginRequest>(&body) {
+                    Ok(req) => {
+                        let res = accounts
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .login(&req.email, &req.password);
+                        match res {
+                            Ok((view, sess_tok)) => {
+                                let payload = serde_json::json!({ "teacher": view }).to_string();
+                                let cookie = format!(
+                                    "Set-Cookie: rb_session={sess_tok}; Path=/; HttpOnly; SameSite=Strict{secure_attr}\r\n"
+                                );
+                                write_response_with_headers(
+                                    &mut stream,
+                                    "200 OK",
+                                    "application/json",
+                                    &cookie,
+                                    payload.as_bytes(),
+                                )
+                            }
+                            Err(err) => {
+                                let payload = serde_json::json!({ "error": err }).to_string();
+                                write_response(
+                                    &mut stream,
+                                    "401 Unauthorized",
+                                    "application/json",
+                                    payload.as_bytes(),
+                                )
+                            }
                         }
                     }
+                    Err(_) => write_response(
+                        &mut stream,
+                        "400 Bad Request",
+                        "application/json",
+                        br#"{"error":"invalid login payload"}"#,
+                    ),
                 }
-                Err(_) => write_response(
-                    &mut stream,
-                    "400 Bad Request",
-                    "application/json",
-                    br#"{"error":"invalid login payload"}"#,
-                ),
-            },
+            }
             ("POST", "/api/auth/logout") => {
                 if let Some(tok) = session_token.as_deref() {
                     accounts
@@ -1175,13 +1648,15 @@ fn handle_connection(
                         .unwrap_or_else(|e| e.into_inner())
                         .logout(tok);
                 }
-                let clear_cookies = "Set-Cookie: rb_session=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict\r\n\
-                                     Set-Cookie: rb_proctor=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict\r\n";
+                let clear_cookies = format!(
+                    "Set-Cookie: rb_session=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict{secure_attr}\r\n\
+                     Set-Cookie: rb_proctor=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict{secure_attr}\r\n"
+                );
                 write_response_with_headers(
                     &mut stream,
                     "200 OK",
                     "application/json",
-                    clear_cookies,
+                    &clear_cookies,
                     br#"{"ok":true}"#,
                 )
             }
@@ -1189,17 +1664,12 @@ fn handle_connection(
                 if !authenticated {
                     return write_unauthorized_api(&mut stream);
                 }
-                let active_room = store
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .room_code
-                    .clone();
                 let rooms = accounts
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .list_rooms_for_owner(owner_id);
                 let payload = serde_json::json!({
-                    "active_room": active_room,
+                    "active_room": admin_room,
                     "rooms": rooms,
                 })
                 .to_string();
@@ -1222,10 +1692,10 @@ fn handle_connection(
                             .create_room(owner_id, &req.name, custom_code);
                         match res {
                             Ok(room) => {
-                                store
+                                registry
                                     .lock()
                                     .unwrap_or_else(|e| e.into_inner())
-                                    .room_code = room.code.clone();
+                                    .get_or_create(&room.code);
                                 let json = serde_json::to_vec(&room).unwrap_or_default();
                                 write_response(&mut stream, "200 OK", "application/json", &json)
                             }
@@ -1263,7 +1733,19 @@ fn handle_connection(
                                 br#"{"error":"room code cannot be empty"}"#,
                             );
                         }
-                        store.lock().unwrap_or_else(|e| e.into_inner()).room_code = code.clone();
+                        if !is_teacher_authorized_for_room(
+                            token_auth,
+                            teacher.as_ref(),
+                            &code,
+                            &default_room,
+                            accounts,
+                        ) {
+                            return write_forbidden_room(&mut stream);
+                        }
+                        registry
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .get_or_create(&code);
                         let payload = serde_json::json!({
                             "ok": true,
                             "active_room": code,
@@ -1288,7 +1770,23 @@ fn handle_connection(
                 if !authenticated {
                     return write_unauthorized_api(&mut stream);
                 }
-                let snap = store.lock().unwrap_or_else(|e| e.into_inner()).snapshot();
+                if !is_teacher_authorized_for_room(
+                    token_auth,
+                    teacher.as_ref(),
+                    &admin_room,
+                    &default_room,
+                    accounts,
+                ) {
+                    return write_forbidden_room(&mut stream);
+                }
+                let room_store = registry
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get_or_create(&admin_room);
+                let snap = room_store
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .snapshot();
                 let json = serde_json::to_vec(&snap).unwrap_or_default();
                 write_response(&mut stream, "200 OK", "application/json", &json)
             }
@@ -1296,63 +1794,155 @@ fn handle_connection(
                 if !authenticated {
                     return write_unauthorized_api(&mut stream);
                 }
-                let creds = store
+                if !is_teacher_authorized_for_room(
+                    token_auth,
+                    teacher.as_ref(),
+                    &admin_room,
+                    &default_room,
+                    accounts,
+                ) {
+                    return write_forbidden_room(&mut stream);
+                }
+                let room_store = registry
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get_or_create(&admin_room);
+                let creds = room_store
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .credentials();
                 let json = serde_json::to_vec(&creds).unwrap_or_default();
-                write_response(&mut stream, "200 OK", "application/json", &json)
+                write_response_with_headers(
+                    &mut stream,
+                    "200 OK",
+                    "application/json",
+                    NO_STORE_HEADERS,
+                    &json,
+                )
             }
-            ("POST", "/api/heartbeat") => match serde_json::from_slice::<StudentHeartbeat>(&body) {
-                Ok(hb) => {
-                    let resp = store
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .ingest_heartbeat(hb);
-                    let json = serde_json::to_vec(&resp).unwrap_or_default();
-                    write_response(&mut stream, "200 OK", "application/json", &json)
+            ("POST", "/api/heartbeat") => {
+                match serde_json::from_slice::<StudentHeartbeat>(&body) {
+                    Ok(hb) => {
+                        let target_room = normalize_room_code(
+                            header_room_code
+                                .as_deref()
+                                .or(hb.room_code.as_deref()),
+                            &default_room,
+                        );
+                        let provided_token =
+                            header_room_token.as_deref().or(hb.join_token.as_deref());
+                        if !verify_student_join_token(
+                            config,
+                            accounts,
+                            &target_room,
+                            provided_token,
+                        ) {
+                            return write_unauthorized_join_token(&mut stream);
+                        }
+                        let room_store = registry
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .get_or_create(&target_room);
+                        let resp = room_store
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .ingest_heartbeat(hb);
+                        let json = serde_json::to_vec(&resp).unwrap_or_default();
+                        write_response(&mut stream, "200 OK", "application/json", &json)
+                    }
+                    Err(_) => write_response(
+                        &mut stream,
+                        "400 Bad Request",
+                        "application/json",
+                        br#"{"error":"invalid heartbeat payload"}"#,
+                    ),
                 }
-                Err(_) => write_response(
-                    &mut stream,
-                    "400 Bad Request",
-                    "application/json",
-                    br#"{"error":"invalid heartbeat payload"}"#,
-                ),
-            },
-            ("POST", "/api/webcam") => match serde_json::from_slice::<WebcamFrameUpload>(&body) {
-                Ok(upload) => {
-                    let ok = store
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .ingest_webcam(upload);
-                    let payload = if ok {
-                        br#"{"ok":true}"#.as_slice()
-                    } else {
-                        br#"{"ok":false}"#.as_slice()
-                    };
-                    write_response(&mut stream, "200 OK", "application/json", payload)
+            }
+            ("POST", "/api/webcam") => {
+                match serde_json::from_slice::<IncomingWebcamUpload>(&body) {
+                    Ok(incoming) => {
+                        let target_room = normalize_room_code(
+                            header_room_code
+                                .as_deref()
+                                .or(incoming.room_code.as_deref()),
+                            &default_room,
+                        );
+                        let provided_token =
+                            header_room_token.as_deref().or(incoming.join_token.as_deref());
+                        if !verify_student_join_token(
+                            config,
+                            accounts,
+                            &target_room,
+                            provided_token,
+                        ) {
+                            return write_unauthorized_join_token(&mut stream);
+                        }
+                        let room_store = registry
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .get_or_create(&target_room);
+                        let ok = room_store
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .ingest_webcam(incoming.upload);
+                        let payload = if ok {
+                            br#"{"ok":true}"#.as_slice()
+                        } else {
+                            br#"{"ok":false}"#.as_slice()
+                        };
+                        write_response(&mut stream, "200 OK", "application/json", payload)
+                    }
+                    Err(_) => write_response(
+                        &mut stream,
+                        "400 Bad Request",
+                        "application/json",
+                        br#"{"error":"invalid webcam payload"}"#,
+                    ),
                 }
-                Err(_) => write_response(
-                    &mut stream,
-                    "400 Bad Request",
-                    "application/json",
-                    br#"{"error":"invalid webcam payload"}"#,
-                ),
-            },
+            }
             ("POST", "/api/unlock-all") => {
                 if !authenticated {
                     return write_unauthorized_api(&mut stream);
                 }
-                store.lock().unwrap_or_else(|e| e.into_inner()).unlock_all();
+                if !is_teacher_authorized_for_room(
+                    token_auth,
+                    teacher.as_ref(),
+                    &admin_room,
+                    &default_room,
+                    accounts,
+                ) {
+                    return write_forbidden_room(&mut stream);
+                }
+                let room_store = registry
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get_or_create(&admin_room);
+                room_store
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .unlock_all();
                 write_response(&mut stream, "200 OK", "application/json", br#"{"ok":true}"#)
             }
             ("POST", "/api/policy") => {
                 if !authenticated {
                     return write_unauthorized_api(&mut stream);
                 }
+                if !is_teacher_authorized_for_room(
+                    token_auth,
+                    teacher.as_ref(),
+                    &admin_room,
+                    &default_room,
+                    accounts,
+                ) {
+                    return write_forbidden_room(&mut stream);
+                }
                 match serde_json::from_slice::<RoomPolicyOverrides>(&body) {
                     Ok(policy) => {
-                        store
+                        let room_store = registry
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .get_or_create(&admin_room);
+                        room_store
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
                             .set_policy(policy.clone());
@@ -1370,6 +1960,15 @@ fn handle_connection(
             ("POST", "/api/credentials") => {
                 if !authenticated {
                     return write_unauthorized_api(&mut stream);
+                }
+                if !is_teacher_authorized_for_room(
+                    token_auth,
+                    teacher.as_ref(),
+                    &admin_room,
+                    &default_room,
+                    accounts,
+                ) {
+                    return write_forbidden_room(&mut stream);
                 }
                 match serde_json::from_slice::<CredentialUpdateRequest>(&body) {
                     Ok(req) => {
@@ -1393,7 +1992,11 @@ fn handle_connection(
                             },
                             None => None,
                         };
-                        let mut guard = store.lock().unwrap_or_else(|e| e.into_inner());
+                        let room_store = registry
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .get_or_create(&admin_room);
+                        let mut guard = room_store.lock().unwrap_or_else(|e| e.into_inner());
                         match req.kind.as_str() {
                             "quit_password" => {
                                 guard.policy.quit_password_hash = hashed;
@@ -1413,7 +2016,13 @@ fn handle_connection(
                             }
                         }
                         let json = serde_json::to_vec(&guard.policy).unwrap_or_default();
-                        write_response(&mut stream, "200 OK", "application/json", &json)
+                        write_response_with_headers(
+                            &mut stream,
+                            "200 OK",
+                            "application/json",
+                            NO_STORE_HEADERS,
+                            &json,
+                        )
                     }
                     Err(_) => write_response(
                         &mut stream,
@@ -1427,9 +2036,22 @@ fn handle_connection(
                 if !authenticated {
                     return write_unauthorized_api(&mut stream);
                 }
+                if !is_teacher_authorized_for_room(
+                    token_auth,
+                    teacher.as_ref(),
+                    &admin_room,
+                    &default_room,
+                    accounts,
+                ) {
+                    return write_forbidden_room(&mut stream);
+                }
                 match serde_json::from_slice::<UnlockRequest>(&body) {
                     Ok(req) => {
-                        let ok = store
+                        let room_store = registry
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .get_or_create(&admin_room);
+                        let ok = room_store
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
                             .unlock_student(&req.student_id);
@@ -1507,11 +2129,17 @@ fn serve_proctor_ws(
 
     let mut last_sent_cam_seq: BTreeMap<String, (u64, Instant)> = BTreeMap::new();
     let mut last_sent_screen_seq: BTreeMap<String, (u64, Instant)> = BTreeMap::new();
+    let mut last_purge = Instant::now();
 
     while !ws_closed.load(Ordering::Acquire) {
+        let now = Instant::now();
         let focused = focused_id.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let active: Vec<(String, SharedWebcamChannel, SharedWebcamChannel)> = {
-            let guard = store.lock().unwrap_or_else(|e| e.into_inner());
+            let mut guard = store.lock().unwrap_or_else(|e| e.into_inner());
+            if now.saturating_duration_since(last_purge) >= Duration::from_millis(500) {
+                guard.purge_expired_frames();
+                last_purge = now;
+            }
             guard
                 .students
                 .iter()
@@ -1527,7 +2155,6 @@ fn serve_proctor_ws(
         };
 
         let n = active.len();
-        let now = Instant::now();
 
         // Prune exited/removed students so rejoining students deliver their first frame immediately.
         last_sent_cam_seq.retain(|sid, _| active.iter().any(|(a, _, _)| a == sid));
@@ -1551,25 +2178,28 @@ fn serve_proctor_ws(
             };
 
             let cam_frame = {
-                let ch = cam_ch.0.lock().unwrap_or_else(|e| e.into_inner());
+                let mut ch = cam_ch.0.lock().unwrap_or_else(|e| e.into_inner());
+                ch.purge_if_expired(now);
                 let due = match last_sent_cam_seq.get(sid) {
                     None => true,
                     Some(&(last_seq, last_time)) => {
                         ch.seq > last_seq && now.duration_since(last_time) >= min_cam_interval
                     }
                 };
-                if !ch.closed && ch.seq > 0 && due {
+                if !ch.closed && ch.seq > 0 && due && ch.is_fresh(now) {
                     ch.jpeg.clone().map(|jpeg| (ch.seq, jpeg))
                 } else {
                     None
                 }
             };
-            if let Some((seq, jpeg)) = cam_frame {
-                let packet = ws::encode_media_packet(ws::MEDIA_KIND_WEBCAM, sid, &jpeg);
+            if let Some((seq, mut jpeg)) = cam_frame {
+                let mut packet = ws::encode_media_packet(ws::MEDIA_KIND_WEBCAM, sid, &jpeg);
+                zeroize_vec(&mut jpeg);
                 let res = {
                     let mut ws_out = write_stream.lock().unwrap_or_else(|e| e.into_inner());
                     ws::write_binary_frame(&mut ws_out, &packet)
                 };
+                zeroize_vec(&mut packet);
                 if res.is_err() {
                     write_failed = true;
                     break;
@@ -1578,25 +2208,28 @@ fn serve_proctor_ws(
             }
 
             let screen_frame = {
-                let ch = screen_ch.0.lock().unwrap_or_else(|e| e.into_inner());
+                let mut ch = screen_ch.0.lock().unwrap_or_else(|e| e.into_inner());
+                ch.purge_if_expired(now);
                 let due = match last_sent_screen_seq.get(sid) {
                     None => true,
                     Some(&(last_seq, last_time)) => {
                         ch.seq > last_seq && now.duration_since(last_time) >= min_screen_interval
                     }
                 };
-                if !ch.closed && ch.seq > 0 && due {
+                if !ch.closed && ch.seq > 0 && due && ch.is_fresh(now) {
                     ch.jpeg.clone().map(|jpeg| (ch.seq, jpeg))
                 } else {
                     None
                 }
             };
-            if let Some((seq, jpeg)) = screen_frame {
-                let packet = ws::encode_media_packet(ws::MEDIA_KIND_SCREEN, sid, &jpeg);
+            if let Some((seq, mut jpeg)) = screen_frame {
+                let mut packet = ws::encode_media_packet(ws::MEDIA_KIND_SCREEN, sid, &jpeg);
+                zeroize_vec(&mut jpeg);
                 let res = {
                     let mut ws_out = write_stream.lock().unwrap_or_else(|e| e.into_inner());
                     ws::write_binary_frame(&mut ws_out, &packet)
                 };
+                zeroize_vec(&mut packet);
                 if res.is_err() {
                     write_failed = true;
                     break;
@@ -1622,7 +2255,7 @@ fn serve_proctor_ws(
 fn serve_mjpeg_stream(stream: &mut TcpStream, channel: SharedWebcamChannel) -> std::io::Result<()> {
     let _ = stream.set_write_timeout(Some(CONNECTION_IO_TIMEOUT));
     stream.write_all(
-        b"HTTP/1.1 200 OK\r\nContent-Type: multipart/x-mixed-replace; boundary=frame\r\nCache-Control: no-store, no-cache, must-revalidate\r\nConnection: close\r\n\r\n",
+        b"HTTP/1.1 200 OK\r\nContent-Type: multipart/x-mixed-replace; boundary=frame\r\nCache-Control: no-store, no-cache, must-revalidate, max-age=0\r\nPragma: no-cache\r\nConnection: close\r\n\r\n",
     )?;
     stream.flush()?;
 
@@ -1633,6 +2266,7 @@ fn serve_mjpeg_stream(stream: &mut TcpStream, channel: SharedWebcamChannel) -> s
             if guard.closed {
                 break;
             }
+            guard.purge_if_expired(Instant::now());
             if guard.seq == last_seq || guard.jpeg.is_none() {
                 let (g, _) = channel
                     .1
@@ -1643,7 +2277,10 @@ fn serve_mjpeg_stream(stream: &mut TcpStream, channel: SharedWebcamChannel) -> s
             if guard.closed {
                 break;
             }
+            let now = Instant::now();
+            guard.purge_if_expired(now);
             if guard.seq != last_seq
+                && guard.is_fresh(now)
                 && let Some(bytes) = guard.jpeg.clone()
             {
                 last_seq = guard.seq;
@@ -1653,16 +2290,17 @@ fn serve_mjpeg_stream(stream: &mut TcpStream, channel: SharedWebcamChannel) -> s
             }
         };
 
-        if let Some(bytes) = frame {
+        if let Some(mut bytes) = frame {
             let header = format!(
                 "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: {}\r\n\r\n",
                 bytes.len()
             );
-            if stream.write_all(header.as_bytes()).is_err()
+            let write_err = stream.write_all(header.as_bytes()).is_err()
                 || stream.write_all(&bytes).is_err()
                 || stream.write_all(b"\r\n").is_err()
-                || stream.flush().is_err()
-            {
+                || stream.flush().is_err();
+            zeroize_vec(&mut bytes);
+            if write_err {
                 break;
             }
         }
@@ -1749,6 +2387,7 @@ mod tests {
         StudentHeartbeat {
             student_id: id.to_string(),
             room_code: Some("ROOM-1".to_string()),
+            join_token: None,
             exam_name: "Unit 4".to_string(),
             config_key: key.to_string(),
             status: StudentStatus::InExam,
@@ -1849,21 +2488,51 @@ mod tests {
         Arc::new(Mutex::new(accounts::AccountStore::new(None)))
     }
 
+    fn new_test_registry(default_room: &str) -> Arc<Mutex<RoomRegistry>> {
+        Arc::new(Mutex::new(RoomRegistry::new(
+            default_room.to_string(),
+            None,
+            None,
+        )))
+    }
+
+    fn new_test_rate_limiter() -> Arc<AuthRateLimiter> {
+        Arc::new(AuthRateLimiter::new())
+    }
+
+    fn default_test_config() -> ServerConfig {
+        ServerConfig {
+            proctor_token: TEST_TOKEN.to_string(),
+            require_join_token: false,
+            cli_join_token: None,
+        }
+    }
+
     #[test]
     fn credentials_api_stores_returns_and_clears_plaintext_for_teacher() {
-        let store = Arc::new(Mutex::new(RoomStore::new("ROOM-1".to_string(), None)));
+        let registry = new_test_registry("ROOM-1");
         let accounts = new_test_accounts();
+        let limiter = new_test_rate_limiter();
+        let config = default_test_config();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
 
         let send_http = |req: String| -> String {
-            let store_clone = Arc::clone(&store);
+            let reg_clone = Arc::clone(&registry);
             let accounts_clone = Arc::clone(&accounts);
+            let limiter_clone = Arc::clone(&limiter);
+            let cfg_clone = config.clone();
             let mut client = TcpStream::connect(addr).unwrap();
             let (server_stream, _) = listener.accept().unwrap();
             let handle = std::thread::spawn(move || {
-                handle_connection(server_stream, &store_clone, &accounts_clone, TEST_TOKEN)
-                    .unwrap();
+                handle_connection(
+                    server_stream,
+                    &reg_clone,
+                    &accounts_clone,
+                    &limiter_clone,
+                    &cfg_clone,
+                )
+                .unwrap();
             });
             client.write_all(req.as_bytes()).unwrap();
             let mut resp = String::new();
@@ -1903,7 +2572,8 @@ mod tests {
         );
 
         // HeartbeatResponse must never contain plaintext credentials.
-        let hb_resp = store
+        let room_store = registry.lock().unwrap().get_or_create("ROOM-1");
+        let hb_resp = room_store
             .lock()
             .unwrap()
             .ingest_heartbeat(sample_hb("alice", "k", vec![]));
@@ -2010,7 +2680,8 @@ mod tests {
 
     #[test]
     fn webcam_raw_keep_alive_and_mjpeg_stream_deliver_frames() {
-        let store = Arc::new(Mutex::new(RoomStore::new("ROOM-1".to_string(), None)));
+        let registry = new_test_registry("ROOM-1");
+        let store = registry.lock().unwrap().get_or_create("ROOM-1");
         store
             .lock()
             .unwrap()
@@ -2020,12 +2691,21 @@ mod tests {
         let addr = listener.local_addr().unwrap();
 
         // 1. Send two raw frames over a single keep-alive TCP connection.
-        let store_post = Arc::clone(&store);
+        let reg_post = Arc::clone(&registry);
         let accounts_post = new_test_accounts();
+        let limiter_post = new_test_rate_limiter();
+        let cfg_post = default_test_config();
         let mut post_client = TcpStream::connect(addr).unwrap();
         let (post_server, _) = listener.accept().unwrap();
         let post_handle = std::thread::spawn(move || {
-            handle_connection(post_server, &store_post, &accounts_post, TEST_TOKEN).unwrap();
+            handle_connection(
+                post_server,
+                &reg_post,
+                &accounts_post,
+                &limiter_post,
+                &cfg_post,
+            )
+            .unwrap();
         });
 
         let f1 = [0xffu8, 0xd8, 0x01, 0xff, 0xd9];
@@ -2071,12 +2751,21 @@ mod tests {
         post_handle.join().unwrap();
 
         // 2. Open GET /api/webcam-stream/erin, verify it streams the latest frame, then close on Exited.
-        let store_stream = Arc::clone(&store);
+        let reg_stream = Arc::clone(&registry);
         let accounts_stream = new_test_accounts();
+        let limiter_stream = new_test_rate_limiter();
+        let cfg_stream = default_test_config();
         let mut viewer = TcpStream::connect(addr).unwrap();
         let (stream_server, _) = listener.accept().unwrap();
         let stream_handle = std::thread::spawn(move || {
-            handle_connection(stream_server, &store_stream, &accounts_stream, TEST_TOKEN).unwrap();
+            handle_connection(
+                stream_server,
+                &reg_stream,
+                &accounts_stream,
+                &limiter_stream,
+                &cfg_stream,
+            )
+            .unwrap();
         });
 
         viewer
@@ -2109,7 +2798,8 @@ mod tests {
 
     #[test]
     fn screen_raw_ingest_stream_and_exited_closing() {
-        let store = Arc::new(Mutex::new(RoomStore::new("ROOM-1".to_string(), None)));
+        let registry = new_test_registry("ROOM-1");
+        let store = registry.lock().unwrap().get_or_create("ROOM-1");
         {
             let mut guard = store.lock().unwrap();
             guard.ingest_heartbeat(sample_hb("frank", "k", vec![]));
@@ -2138,12 +2828,21 @@ mod tests {
         let addr = listener.local_addr().unwrap();
 
         // 1. Send two screen frames over keep-alive POST /api/screen-raw/frank (including >512 KiB).
-        let store_post = Arc::clone(&store);
+        let reg_post = Arc::clone(&registry);
         let accounts_post = new_test_accounts();
+        let limiter_post = new_test_rate_limiter();
+        let cfg_post = default_test_config();
         let mut post_client = TcpStream::connect(addr).unwrap();
         let (post_server, _) = listener.accept().unwrap();
         let post_handle = std::thread::spawn(move || {
-            handle_connection(post_server, &store_post, &accounts_post, TEST_TOKEN).unwrap();
+            handle_connection(
+                post_server,
+                &reg_post,
+                &accounts_post,
+                &limiter_post,
+                &cfg_post,
+            )
+            .unwrap();
         });
 
         let mut large_frame = vec![0x55u8; 600 * 1024];
@@ -2189,12 +2888,21 @@ mod tests {
         post_handle.join().unwrap();
 
         // 2. Open GET /api/screen-stream/frank, verify it streams s2, then closes on Exited.
-        let store_stream = Arc::clone(&store);
+        let reg_stream = Arc::clone(&registry);
         let accounts_stream = new_test_accounts();
+        let limiter_stream = new_test_rate_limiter();
+        let cfg_stream = default_test_config();
         let mut viewer = TcpStream::connect(addr).unwrap();
         let (stream_server, _) = listener.accept().unwrap();
         let stream_handle = std::thread::spawn(move || {
-            handle_connection(stream_server, &store_stream, &accounts_stream, TEST_TOKEN).unwrap();
+            handle_connection(
+                stream_server,
+                &reg_stream,
+                &accounts_stream,
+                &limiter_stream,
+                &cfg_stream,
+            )
+            .unwrap();
         });
 
         viewer
@@ -2247,19 +2955,29 @@ mod tests {
 
     #[test]
     fn admin_routes_require_proctor_auth_and_bootstrap_cookie_works() {
-        let store = Arc::new(Mutex::new(RoomStore::new("ROOM-1".to_string(), None)));
+        let registry = new_test_registry("ROOM-1");
         let accounts = new_test_accounts();
+        let limiter = new_test_rate_limiter();
+        let config = default_test_config();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
 
         let send_raw = |req: String| -> String {
-            let store_clone = Arc::clone(&store);
+            let reg_clone = Arc::clone(&registry);
             let accounts_clone = Arc::clone(&accounts);
+            let limiter_clone = Arc::clone(&limiter);
+            let cfg_clone = config.clone();
             let mut client = TcpStream::connect(addr).unwrap();
             let (server_stream, _) = listener.accept().unwrap();
             let handle = std::thread::spawn(move || {
-                handle_connection(server_stream, &store_clone, &accounts_clone, TEST_TOKEN)
-                    .unwrap();
+                handle_connection(
+                    server_stream,
+                    &reg_clone,
+                    &accounts_clone,
+                    &limiter_clone,
+                    &cfg_clone,
+                )
+                .unwrap();
             });
             client.write_all(req.as_bytes()).unwrap();
             let mut resp = String::new();
@@ -2360,19 +3078,29 @@ mod tests {
 
     #[test]
     fn bounded_headers_and_connection_guard_enforce_limits() {
-        let store = Arc::new(Mutex::new(RoomStore::new("ROOM-1".to_string(), None)));
+        let registry = new_test_registry("ROOM-1");
         let accounts = new_test_accounts();
+        let limiter = new_test_rate_limiter();
+        let config = default_test_config();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
 
         let send_raw = |req: String| -> String {
-            let store_clone = Arc::clone(&store);
+            let reg_clone = Arc::clone(&registry);
             let accounts_clone = Arc::clone(&accounts);
+            let limiter_clone = Arc::clone(&limiter);
+            let cfg_clone = config.clone();
             let mut client = TcpStream::connect(addr).unwrap();
             let (server_stream, _) = listener.accept().unwrap();
             let handle = std::thread::spawn(move || {
-                handle_connection(server_stream, &store_clone, &accounts_clone, TEST_TOKEN)
-                    .unwrap();
+                handle_connection(
+                    server_stream,
+                    &reg_clone,
+                    &accounts_clone,
+                    &limiter_clone,
+                    &cfg_clone,
+                )
+                .unwrap();
             });
             let _ = client.write_all(req.as_bytes());
             let mut resp = String::new();
@@ -2432,19 +3160,29 @@ mod tests {
 
     #[test]
     fn teacher_auth_rooms_and_multiplexed_ws_flow() {
-        let store = Arc::new(Mutex::new(RoomStore::new("ROOM-1".to_string(), None)));
+        let registry = new_test_registry("ROOM-1");
         let accounts = new_test_accounts();
+        let limiter = new_test_rate_limiter();
+        let config = default_test_config();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
 
         let send_raw = |req: String| -> String {
-            let store_clone = Arc::clone(&store);
+            let reg_clone = Arc::clone(&registry);
             let accounts_clone = Arc::clone(&accounts);
+            let limiter_clone = Arc::clone(&limiter);
+            let cfg_clone = config.clone();
             let mut client = TcpStream::connect(addr).unwrap();
             let (server_stream, _) = listener.accept().unwrap();
             let handle = std::thread::spawn(move || {
-                handle_connection(server_stream, &store_clone, &accounts_clone, TEST_TOKEN)
-                    .unwrap();
+                handle_connection(
+                    server_stream,
+                    &reg_clone,
+                    &accounts_clone,
+                    &limiter_clone,
+                    &cfg_clone,
+                )
+                .unwrap();
             });
             client.write_all(req.as_bytes()).unwrap();
             let mut resp = String::new();
@@ -2498,7 +3236,7 @@ mod tests {
         assert_eq!(rooms0["active_room"], "ROOM-1");
         assert_eq!(rooms0["rooms"].as_array().unwrap().len(), 0);
 
-        // 5. POST /api/rooms -> creates room and switches active_room.
+        // 5. POST /api/rooms -> creates room with a 32-char join token.
         let create_body = r#"{"name":"AP CS Period 2","code":"k7m-92p"}"#;
         let r_create = send_raw(format!(
             "POST /api/rooms HTTP/1.1\r\nHost: localhost\r\nCookie: {session_cookie}\r\nContent-Length: {}\r\n\r\n{}",
@@ -2510,31 +3248,34 @@ mod tests {
             serde_json::from_str(r_create.split("\r\n\r\n").nth(1).unwrap()).unwrap();
         assert_eq!(created["code"], "K7M-92P");
         assert_eq!(created["name"], "AP CS Period 2");
-        assert_eq!(store.lock().unwrap().room_code, "K7M-92P");
+        assert_eq!(created["join_token"].as_str().unwrap().len(), 32);
 
-        // 6. GET /ws/proctor with rb_session cookie -> 101 handshake + multiplexed webcam & screen frames.
+        // 6. GET /ws/proctor?room=K7M-92P with rb_session cookie -> 101 handshake + multiplexed webcam & screen frames.
         {
-            let mut guard = store.lock().unwrap();
+            let room_store = registry.lock().unwrap().get_or_create("K7M-92P");
+            let mut guard = room_store.lock().unwrap();
             guard.ingest_heartbeat(sample_hb("stu1", "k", vec![]));
             guard.ingest_webcam_raw("stu1".to_string(), vec![0xff, 0xd8, 0x11, 0xff, 0xd9]);
             guard.ingest_screen_raw("stu1", vec![0xff, 0xd8, 0x22, 0x33, 0xff, 0xd9]);
         }
 
-        let store_ws = Arc::clone(&store);
+        let reg_ws = Arc::clone(&registry);
         let accounts_ws = Arc::clone(&accounts);
+        let limiter_ws = Arc::clone(&limiter);
+        let cfg_ws = config.clone();
         let mut ws_client = TcpStream::connect(addr).unwrap();
         ws_client
             .set_read_timeout(Some(Duration::from_secs(3)))
             .unwrap();
         let (ws_server, _) = listener.accept().unwrap();
         let ws_handle = std::thread::spawn(move || {
-            handle_connection(ws_server, &store_ws, &accounts_ws, TEST_TOKEN).unwrap();
+            handle_connection(ws_server, &reg_ws, &accounts_ws, &limiter_ws, &cfg_ws).unwrap();
         });
 
         ws_client
             .write_all(
                 format!(
-                    "GET /ws/proctor HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nCookie: {session_cookie}\r\n\r\n"
+                    "GET /ws/proctor?room=K7M-92P HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nCookie: {session_cookie}\r\n\r\n"
                 )
                 .as_bytes(),
             )
@@ -2610,5 +3351,463 @@ mod tests {
         let me2: serde_json::Value =
             serde_json::from_str(r_me2.split("\r\n\r\n").nth(1).unwrap()).unwrap();
         assert_eq!(me2["authenticated"], false);
+    }
+
+    #[test]
+    fn expired_frames_are_purged_and_zeroed_and_https_proxy_sets_secure_cookie() {
+        // 1. Verify zeroize_vec clears bytes.
+        let mut buf = vec![0xffu8, 0xd8, 0xaa, 0xbb];
+        zeroize_vec(&mut buf);
+        assert!(buf.is_empty());
+
+        // 2. Verify frames older than FRAME_TTL are purged and has_webcam/has_screen become false.
+        let mut store = RoomStore::new("ROOM-TTL".to_string(), None);
+        store.ingest_heartbeat(sample_hb("zoe", "k", vec![]));
+        assert!(store.ingest_webcam(WebcamFrameUpload {
+            student_id: "zoe".to_string(),
+            data_url: "data:image/jpeg;base64,/9j/4AAQ".to_string(),
+        }));
+        assert!(store.ingest_screen_raw("zoe", vec![0xff, 0xd8, 0x77, 0xff, 0xd9]));
+
+        {
+            let snap = store.snapshot();
+            let s = snap.students.iter().find(|s| s.student_id == "zoe").unwrap();
+            assert!(s.has_webcam);
+            assert!(s.has_screen);
+            assert!(store.get_webcam("zoe").is_some());
+        }
+
+        // Backdate frame timestamps past FRAME_TTL.
+        let expired = Instant::now() - FRAME_TTL - Duration::from_secs(1);
+        {
+            let rec = store.students.get_mut("zoe").unwrap();
+            rec.webcam_data_url_at = Some(expired);
+            rec.webcam_channel.0.lock().unwrap().captured_at = Some(expired);
+            rec.screen_channel.0.lock().unwrap().captured_at = Some(expired);
+        }
+
+        let snap_after = store.snapshot();
+        let s_after = snap_after
+            .students
+            .iter()
+            .find(|s| s.student_id == "zoe")
+            .unwrap();
+        assert!(!s_after.has_webcam);
+        assert!(!s_after.has_screen);
+        assert_eq!(store.get_webcam("zoe"), None);
+        {
+            let rec = store.students.get("zoe").unwrap();
+            assert!(rec.webcam_data_url.is_none());
+            assert!(rec.webcam_data_url_at.is_none());
+            let cam = rec.webcam_channel.0.lock().unwrap();
+            assert!(cam.jpeg.is_none());
+            assert!(cam.captured_at.is_none());
+            let scr = rec.screen_channel.0.lock().unwrap();
+            assert!(scr.jpeg.is_none());
+            assert!(scr.captured_at.is_none());
+        }
+
+        // 3. Verify X-Forwarded-Proto: https sets `; Secure` on auth cookies and no-store headers on media/credentials.
+        let registry = new_test_registry("ROOM-TTL");
+        let accounts = new_test_accounts();
+        let limiter = new_test_rate_limiter();
+        let config = default_test_config();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let send_raw = |req: String| -> String {
+            let reg_clone = Arc::clone(&registry);
+            let accounts_clone = Arc::clone(&accounts);
+            let limiter_clone = Arc::clone(&limiter);
+            let cfg_clone = config.clone();
+            let mut client = TcpStream::connect(addr).unwrap();
+            let (server_stream, _) = listener.accept().unwrap();
+            let handle = std::thread::spawn(move || {
+                handle_connection(
+                    server_stream,
+                    &reg_clone,
+                    &accounts_clone,
+                    &limiter_clone,
+                    &cfg_clone,
+                )
+                .unwrap();
+            });
+            client.write_all(req.as_bytes()).unwrap();
+            let mut resp = String::new();
+            client.read_to_string(&mut resp).unwrap();
+            handle.join().unwrap();
+            resp
+        };
+
+        // Bootstrap /?token=... behind HTTPS reverse proxy -> Secure cookie.
+        let r_boot_https = send_raw(format!(
+            "GET /?token={TEST_TOKEN} HTTP/1.1\r\nHost: proctor.example.edu\r\nX-Forwarded-Proto: https\r\n\r\n"
+        ));
+        assert!(r_boot_https.starts_with("HTTP/1.1 302 Found"));
+        assert!(r_boot_https.contains(&format!(
+            "Set-Cookie: rb_proctor={TEST_TOKEN}; Path=/; HttpOnly; SameSite=Strict; Secure\r\n"
+        )));
+
+        // Register behind HTTPS reverse proxy -> Secure cookie.
+        let reg_body = r#"{"name":"Dr. Turing","email":"alan@school.edu","password":"password123"}"#;
+        let r_reg_https = send_raw(format!(
+            "POST /api/auth/register HTTP/1.1\r\nHost: proctor.example.edu\r\nX-Forwarded-Proto: https\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            reg_body.len(),
+            reg_body
+        ));
+        assert!(r_reg_https.starts_with("HTTP/1.1 200 OK"));
+        assert!(r_reg_https.contains("HttpOnly; SameSite=Strict; Secure\r\n"));
+
+        // Login behind HTTPS reverse proxy -> Secure cookie.
+        let login_body = r#"{"email":"alan@school.edu","password":"password123"}"#;
+        let r_login_https = send_raw(format!(
+            "POST /api/auth/login HTTP/1.1\r\nHost: proctor.example.edu\r\nX-Forwarded-Proto: https\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            login_body.len(),
+            login_body
+        ));
+        assert!(r_login_https.starts_with("HTTP/1.1 200 OK"));
+        assert!(r_login_https.contains("HttpOnly; SameSite=Strict; Secure\r\n"));
+
+        // Plain HTTP login omits Secure so localhost works.
+        let r_login_http = send_raw(format!(
+            "POST /api/auth/login HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            login_body.len(),
+            login_body
+        ));
+        assert!(r_login_http.starts_with("HTTP/1.1 200 OK"));
+        assert!(!r_login_http.contains("; Secure"));
+
+        // Cache-Control no-store + Pragma: no-cache on /api/credentials and /api/webcam/*.
+        let r_creds = send_raw(format!(
+            "GET /api/credentials HTTP/1.1\r\nHost: localhost\r\nX-Proctor-Token: {TEST_TOKEN}\r\n\r\n"
+        ));
+        assert!(r_creds.contains("Cache-Control: no-store, no-cache, must-revalidate, max-age=0\r\n"));
+        assert!(r_creds.contains("Pragma: no-cache\r\n"));
+
+        let r_cam = send_raw(format!(
+            "GET /api/webcam/zoe HTTP/1.1\r\nHost: localhost\r\nX-Proctor-Token: {TEST_TOKEN}\r\n\r\n"
+        ));
+        assert!(r_cam.contains("Cache-Control: no-store, no-cache, must-revalidate, max-age=0\r\n"));
+        assert!(r_cam.contains("Pragma: no-cache\r\n"));
+    }
+
+    fn extract_session_cookie(resp: &str) -> String {
+        resp.lines()
+            .find_map(|line| {
+                line.strip_prefix("Set-Cookie: ")
+                    .and_then(|v| v.split(';').next())
+                    .filter(|c| c.starts_with("rb_session="))
+                    .map(str::to_string)
+            })
+            .expect("rb_session cookie returned")
+    }
+
+    #[test]
+    fn multi_tenant_room_isolation_forbids_cross_teacher_access() {
+        let registry = new_test_registry("DEFAULT-ROOM");
+        let accounts = new_test_accounts();
+        let limiter = new_test_rate_limiter();
+        let config = default_test_config();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let send_raw = |req: String| -> String {
+            let reg_clone = Arc::clone(&registry);
+            let accounts_clone = Arc::clone(&accounts);
+            let limiter_clone = Arc::clone(&limiter);
+            let cfg_clone = config.clone();
+            let mut client = TcpStream::connect(addr).unwrap();
+            let (server_stream, _) = listener.accept().unwrap();
+            let handle = std::thread::spawn(move || {
+                handle_connection(
+                    server_stream,
+                    &reg_clone,
+                    &accounts_clone,
+                    &limiter_clone,
+                    &cfg_clone,
+                )
+                .unwrap();
+            });
+            client.write_all(req.as_bytes()).unwrap();
+            let mut resp = String::new();
+            client.read_to_string(&mut resp).unwrap();
+            handle.join().unwrap();
+            resp
+        };
+
+        // Register Teacher A and Teacher B.
+        let reg_a = r#"{"name":"Teacher A","email":"a@school.edu","password":"password123"}"#;
+        let r_reg_a = send_raw(format!(
+            "POST /api/auth/register HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n{}",
+            reg_a.len(),
+            reg_a
+        ));
+        assert!(r_reg_a.starts_with("HTTP/1.1 200 OK"));
+        let cookie_a = extract_session_cookie(&r_reg_a);
+
+        let reg_b = r#"{"name":"Teacher B","email":"b@school.edu","password":"password123"}"#;
+        let r_reg_b = send_raw(format!(
+            "POST /api/auth/register HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n{}",
+            reg_b.len(),
+            reg_b
+        ));
+        assert!(r_reg_b.starts_with("HTTP/1.1 200 OK"));
+        let cookie_b = extract_session_cookie(&r_reg_b);
+
+        // Teacher A creates ROOM-A, Teacher B creates ROOM-B.
+        let create_a = r#"{"name":"Algebra","code":"ROOM-A"}"#;
+        let r_ca = send_raw(format!(
+            "POST /api/rooms HTTP/1.1\r\nHost: localhost\r\nCookie: {cookie_a}\r\nContent-Length: {}\r\n\r\n{}",
+            create_a.len(),
+            create_a
+        ));
+        assert!(r_ca.starts_with("HTTP/1.1 200 OK"));
+
+        let create_b = r#"{"name":"Biology","code":"ROOM-B"}"#;
+        let r_cb = send_raw(format!(
+            "POST /api/rooms HTTP/1.1\r\nHost: localhost\r\nCookie: {cookie_b}\r\nContent-Length: {}\r\n\r\n{}",
+            create_b.len(),
+            create_b
+        ));
+        assert!(r_cb.starts_with("HTTP/1.1 200 OK"));
+
+        // Student joins ROOM-A via heartbeat.
+        let mut hb_a = sample_hb("stu-a", "k", vec![]);
+        hb_a.room_code = Some("ROOM-A".to_string());
+        let hb_a_body = serde_json::to_string(&hb_a).unwrap();
+        let r_hb = send_raw(format!(
+            "POST /api/heartbeat HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n{}",
+            hb_a_body.len(),
+            hb_a_body
+        ));
+        assert!(r_hb.starts_with("HTTP/1.1 200 OK"));
+
+        // Teacher A sees stu-a in ROOM-A; Teacher B sees 0 students in ROOM-B.
+        let r_state_a = send_raw(format!(
+            "GET /api/state?room=ROOM-A HTTP/1.1\r\nHost: localhost\r\nCookie: {cookie_a}\r\n\r\n"
+        ));
+        assert!(r_state_a.starts_with("HTTP/1.1 200 OK"));
+        let state_a: serde_json::Value =
+            serde_json::from_str(r_state_a.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(state_a["room_code"], "ROOM-A");
+        assert_eq!(state_a["total_students"], 1);
+
+        let r_state_b = send_raw(format!(
+            "GET /api/state?room=ROOM-B HTTP/1.1\r\nHost: localhost\r\nCookie: {cookie_b}\r\n\r\n"
+        ));
+        assert!(r_state_b.starts_with("HTTP/1.1 200 OK"));
+        let state_b: serde_json::Value =
+            serde_json::from_str(r_state_b.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(state_b["room_code"], "ROOM-B");
+        assert_eq!(state_b["total_students"], 0);
+
+        // Teacher B gets 403 Forbidden on Teacher A's room for /api/state, /api/policy, /api/unlock-all, and /ws/proctor.
+        let r_forbid_state = send_raw(format!(
+            "GET /api/state?room=ROOM-A HTTP/1.1\r\nHost: localhost\r\nCookie: {cookie_b}\r\n\r\n"
+        ));
+        assert!(r_forbid_state.starts_with("HTTP/1.1 403 Forbidden"));
+        assert!(r_forbid_state.ends_with(r#"{"error":"forbidden: room belongs to another teacher"}"#));
+
+        let pol_body = serde_json::to_string(&RoomPolicyOverrides::default()).unwrap();
+        let r_forbid_policy = send_raw(format!(
+            "POST /api/policy?room=ROOM-A HTTP/1.1\r\nHost: localhost\r\nCookie: {cookie_b}\r\nContent-Length: {}\r\n\r\n{}",
+            pol_body.len(),
+            pol_body
+        ));
+        assert!(r_forbid_policy.starts_with("HTTP/1.1 403 Forbidden"));
+        assert!(r_forbid_policy.ends_with(r#"{"error":"forbidden: room belongs to another teacher"}"#));
+
+        let r_forbid_unlock = send_raw(format!(
+            "POST /api/unlock-all?room=ROOM-A HTTP/1.1\r\nHost: localhost\r\nCookie: {cookie_b}\r\n\r\n"
+        ));
+        assert!(r_forbid_unlock.starts_with("HTTP/1.1 403 Forbidden"));
+        assert!(r_forbid_unlock.ends_with(r#"{"error":"forbidden: room belongs to another teacher"}"#));
+
+        let r_forbid_ws = send_raw(format!(
+            "GET /ws/proctor?room=ROOM-A HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nCookie: {cookie_b}\r\n\r\n"
+        ));
+        assert!(r_forbid_ws.starts_with("HTTP/1.1 403 Forbidden"));
+    }
+
+    #[test]
+    fn require_join_token_enforces_per_room_student_tokens() {
+        let registry = new_test_registry("ROOM-SEC");
+        let accounts = new_test_accounts();
+        let limiter = new_test_rate_limiter();
+        let config = ServerConfig {
+            proctor_token: TEST_TOKEN.to_string(),
+            require_join_token: true,
+            cli_join_token: None,
+        };
+
+        let join_token = {
+            let mut guard = accounts.lock().unwrap();
+            let (teacher, _) = guard
+                .register("Ms. Ada", "ada@school.edu", "password123")
+                .unwrap();
+            guard
+                .create_room(&teacher.id, "Secure Room", Some("ROOM-SEC"))
+                .unwrap()
+                .join_token
+        };
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let send_raw = |req: String| -> String {
+            let reg_clone = Arc::clone(&registry);
+            let accounts_clone = Arc::clone(&accounts);
+            let limiter_clone = Arc::clone(&limiter);
+            let cfg_clone = config.clone();
+            let mut client = TcpStream::connect(addr).unwrap();
+            let (server_stream, _) = listener.accept().unwrap();
+            let handle = std::thread::spawn(move || {
+                handle_connection(
+                    server_stream,
+                    &reg_clone,
+                    &accounts_clone,
+                    &limiter_clone,
+                    &cfg_clone,
+                )
+                .unwrap();
+            });
+            client.write_all(req.as_bytes()).unwrap();
+            let mut resp = String::new();
+            client.read_to_string(&mut resp).unwrap();
+            handle.join().unwrap();
+            resp
+        };
+
+        let mut hb = sample_hb("stu-sec", "k", vec![]);
+        hb.room_code = Some("ROOM-SEC".to_string());
+        let hb_body = serde_json::to_string(&hb).unwrap();
+
+        // Missing token -> 401 Unauthorized.
+        let r_no_tok = send_raw(format!(
+            "POST /api/heartbeat HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n{}",
+            hb_body.len(),
+            hb_body
+        ));
+        assert!(r_no_tok.starts_with("HTTP/1.1 401 Unauthorized"));
+
+        // Wrong token -> 401 Unauthorized.
+        let r_bad_tok = send_raw(format!(
+            "POST /api/heartbeat HTTP/1.1\r\nHost: localhost\r\nX-Room-Code: ROOM-SEC\r\nX-Room-Token: wrongtoken\r\nContent-Length: {}\r\n\r\n{}",
+            hb_body.len(),
+            hb_body
+        ));
+        assert!(r_bad_tok.starts_with("HTTP/1.1 401 Unauthorized"));
+
+        // Valid token via X-Room-Token header -> 200 OK.
+        let r_ok_hdr = send_raw(format!(
+            "POST /api/heartbeat HTTP/1.1\r\nHost: localhost\r\nX-Room-Code: ROOM-SEC\r\nX-Room-Token: {join_token}\r\nContent-Length: {}\r\n\r\n{}",
+            hb_body.len(),
+            hb_body
+        ));
+        assert!(r_ok_hdr.starts_with("HTTP/1.1 200 OK"));
+
+        // Valid token via JSON body join_token field -> 200 OK.
+        let mut hb_val = serde_json::to_value(&hb).unwrap();
+        hb_val["join_token"] = serde_json::Value::String(join_token.clone());
+        let hb_json_tok = serde_json::to_string(&hb_val).unwrap();
+        let r_ok_body = send_raw(format!(
+            "POST /api/heartbeat HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n{}",
+            hb_json_tok.len(),
+            hb_json_tok
+        ));
+        assert!(r_ok_body.starts_with("HTTP/1.1 200 OK"));
+
+        // Webcam upload without token -> 401; with valid token -> 200 OK.
+        let cam_body = r#"{"student_id":"stu-sec","data_url":"data:image/jpeg;base64,/9j/4AAQ"}"#;
+        let r_cam_no_tok = send_raw(format!(
+            "POST /api/webcam HTTP/1.1\r\nHost: localhost\r\nX-Room-Code: ROOM-SEC\r\nContent-Length: {}\r\n\r\n{}",
+            cam_body.len(),
+            cam_body
+        ));
+        assert!(r_cam_no_tok.starts_with("HTTP/1.1 401 Unauthorized"));
+
+        let r_cam_ok = send_raw(format!(
+            "POST /api/webcam HTTP/1.1\r\nHost: localhost\r\nX-Room-Code: ROOM-SEC\r\nX-Room-Token: {join_token}\r\nContent-Length: {}\r\n\r\n{}",
+            cam_body.len(),
+            cam_body
+        ));
+        assert!(r_cam_ok.starts_with("HTTP/1.1 200 OK"));
+
+        // Raw webcam upload without token -> 401; with valid token -> 200 OK.
+        let r_raw_no_tok = send_raw(
+            "POST /api/webcam-raw/stu-sec HTTP/1.1\r\nHost: localhost\r\nX-Room-Code: ROOM-SEC\r\nConnection: close\r\nContent-Length: 4\r\n\r\n\x01\x02\x03\x04".to_string(),
+        );
+        assert!(r_raw_no_tok.starts_with("HTTP/1.1 401 Unauthorized"));
+
+        let r_raw_ok = send_raw(format!(
+            "POST /api/webcam-raw/stu-sec HTTP/1.1\r\nHost: localhost\r\nX-Room-Code: ROOM-SEC\r\nX-Room-Token: {join_token}\r\nConnection: close\r\nContent-Length: 4\r\n\r\n\x01\x02\x03\x04"
+        ));
+        assert!(r_raw_ok.starts_with("HTTP/1.1 200 OK"));
+    }
+
+    #[test]
+    fn auth_rate_limiter_blocks_after_ten_attempts_per_ip() {
+        let registry = new_test_registry("ROOM-RL");
+        let accounts = new_test_accounts();
+        let limiter = new_test_rate_limiter();
+        let config = default_test_config();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let send_raw = |req: String| -> String {
+            let reg_clone = Arc::clone(&registry);
+            let accounts_clone = Arc::clone(&accounts);
+            let limiter_clone = Arc::clone(&limiter);
+            let cfg_clone = config.clone();
+            let mut client = TcpStream::connect(addr).unwrap();
+            let (server_stream, _) = listener.accept().unwrap();
+            let handle = std::thread::spawn(move || {
+                handle_connection(
+                    server_stream,
+                    &reg_clone,
+                    &accounts_clone,
+                    &limiter_clone,
+                    &cfg_clone,
+                )
+                .unwrap();
+            });
+            client.write_all(req.as_bytes()).unwrap();
+            let mut resp = String::new();
+            client.read_to_string(&mut resp).unwrap();
+            handle.join().unwrap();
+            resp
+        };
+
+        let login_body = r#"{"email":"nobody@school.edu","password":"wrongpassword"}"#;
+        for i in 0..AUTH_RATE_LIMIT_MAX_ATTEMPTS {
+            let resp = send_raw(format!(
+                "POST /api/auth/login HTTP/1.1\r\nHost: localhost\r\nX-Real-IP: 203.0.113.10\r\nContent-Length: {}\r\n\r\n{}",
+                login_body.len(),
+                login_body
+            ));
+            assert!(
+                resp.starts_with("HTTP/1.1 401 Unauthorized"),
+                "attempt {} expected 401, got: {}",
+                i + 1,
+                resp
+            );
+        }
+
+        // 11th attempt from the same IP -> 429 Too Many Requests with Retry-After: 60.
+        let r_limited = send_raw(format!(
+            "POST /api/auth/login HTTP/1.1\r\nHost: localhost\r\nX-Real-IP: 203.0.113.10\r\nContent-Length: {}\r\n\r\n{}",
+            login_body.len(),
+            login_body
+        ));
+        assert!(r_limited.starts_with("HTTP/1.1 429 Too Many Requests"));
+        assert!(r_limited.contains("Retry-After: 60\r\n"));
+
+        // A different client IP behind the proxy is not rate-limited.
+        let r_other_ip = send_raw(format!(
+            "POST /api/auth/login HTTP/1.1\r\nHost: localhost\r\nX-Forwarded-For: 198.51.100.7, 127.0.0.1\r\nContent-Length: {}\r\n\r\n{}",
+            login_body.len(),
+            login_body
+        ));
+        assert!(r_other_ip.starts_with("HTTP/1.1 401 Unauthorized"));
     }
 }

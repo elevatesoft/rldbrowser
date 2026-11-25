@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1] - 2026-11-25
+
+### Added
+- Native macOS `https://` proctor client transport via `NSURLSession` (TLS 1.3 + HTTP/2 connection pooling + system Keychain root CA trust).
+- Per-room 128-bit student join tokens (`--require-join-token`, `X-Room-Code` & `X-Room-Token` headers) and multi-tenant teacher room isolation (`403 Forbidden` across teachers).
+- Production Oracle Cloud Always Free deployment configs (`deploy/oracle-cloud/Caddyfile`, `rld-proctor.service`, and setup guide).
+- Full GitHub Release packaging: macOS `.dmg` drag-to-Applications installer, `.zip` bundle, prebuilt `rld-proctor` binaries for macOS ARM64 and Linux ARM64/x86_64, and `SHA256SUMS.txt`.
+
+### Security
+- Strict 3-second zero-retention RAM TTL for all webcam and screen frames with safe byte zeroization on replacement, expiration, exit, and drop; `Cache-Control: no-store` on all media/credential endpoints; browser-side `ObjectURL` revocation on stale/exited streams.
+- Per-IP sliding-window rate limiting (`429 Too Many Requests`) on `/api/auth/login` and `/api/auth/register`, and automatic `; Secure` session cookies behind `X-Forwarded-Proto: https`.
+
+### Changed
+- Replaced top-left `DEV` and `CAM` HUD badges with a clean version pill (`v0.2.1`).
+- Styled destructive proctor actions (`End session`, `End student session`, `End exam for all`) in consistent red.
+
 ## [0.2.0] - 2026-11-25
 
 ### Added

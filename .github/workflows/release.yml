@@ -6,10 +6,10 @@ on:
       - 'v*'
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  release:
+  build-macos:
     runs-on: macos-14
     timeout-minutes: 15
     steps:
@@ -19,43 +19,124 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Build macOS release bundle
+      - name: Build macOS release bundle and DMG
+        env:
+          BUILD_DMG: '1'
         run: ./scripts/bundle-macos.sh
 
-      - name: Package release archives
+      - name: Package versioned macOS artifacts
         run: |
-          APP_ZIP="dist/RLD-Browser-${GITHUB_REF_NAME}-macos-arm64.zip"
-          PROCTOR_TAR="dist/rld-proctor-${GITHUB_REF_NAME}-macos-arm64.tar.gz"
+          TAG="${GITHUB_REF_NAME}"
+          mkdir -p release-artifacts
+          cp "dist/RLD-Browser-macos-arm64.dmg" "release-artifacts/RLD-Browser-${TAG}-macos-arm64.dmg"
+          ditto -c -k --sequesterRsrc --keepParent "dist/RLD Browser.app" "release-artifacts/RLD-Browser-${TAG}-macos-arm64.zip"
+          tar -czf "release-artifacts/rld-proctor-${TAG}-macos-arm64.tar.gz" -C dist rld-proctor
 
-          ditto -c -k --sequesterRsrc --keepParent "dist/RLD Browser.app" "$APP_ZIP"
-          tar -czf "$PROCTOR_TAR" -C dist rld-proctor
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-artifacts
+          path: release-artifacts/*
+          if-no-files-found: error
 
-          echo "APP_ZIP=$APP_ZIP" >> "$GITHUB_ENV"
-          echo "PROCTOR_TAR=$PROCTOR_TAR" >> "$GITHUB_ENV"
+  build-linux-proctor:
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            arch: x86_64
+          - os: ubuntu-24.04-arm
+            arch: aarch64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
 
-      - name: Extract changelog notes
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build rld-proctor (${{ matrix.arch }})
+        run: cargo build --release -p rustbrowser-proctor
+
+      - name: Package rld-proctor (${{ matrix.arch }})
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
+          TAG="${GITHUB_REF_NAME}"
+          ARCH="${{ matrix.arch }}"
+          STAGE_DIR="$(mktemp -d)"
+          mkdir -p release-artifacts
+          cp target/release/rustbrowser-proctor "$STAGE_DIR/rld-proctor"
+          chmod +x "$STAGE_DIR/rld-proctor"
+          tar -czf "release-artifacts/rld-proctor-${TAG}-linux-${ARCH}.tar.gz" -C "$STAGE_DIR" rld-proctor
+          rm -rf "$STAGE_DIR"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-proctor-${{ matrix.arch }}
+          path: release-artifacts/*
+          if-no-files-found: error
+
+  publish:
+    needs: [build-macos, build-linux-proctor]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts
+          merge-multiple: true
+
+      - name: Generate SHA256SUMS.txt
+        working-directory: release-artifacts
+        run: |
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Build release notes
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          VERSION="${TAG#v}"
           awk -v ver="$VERSION" '
             index($0, "## [" ver "]") == 1 { found=1; next }
             found && /^## \[/ { exit }
             found { print }
           ' CHANGELOG.md | sed '/./,$!d' > release_notes.md || true
 
+          if [ ! -s release_notes.md ]; then
+            printf "Release %s of RLD Browser and RLD Proctor.\n" "$TAG" > release_notes.md
+          fi
+
+          cat <<EOF >> release_notes.md
+
+          ## Artifacts & Verification
+
+          | Artifact | Platform | Description |
+          | --- | --- | --- |
+          | \`RLD-Browser-${TAG}-macos-arm64.dmg\` | macOS (Apple Silicon) | Drag-to-Applications installer |
+          | \`RLD-Browser-${TAG}-macos-arm64.zip\` | macOS (Apple Silicon) | Zipped \`RLD Browser.app\` bundle |
+          | \`rld-proctor-${TAG}-macos-arm64.tar.gz\` | macOS (Apple Silicon) | Standalone \`rld-proctor\` server binary |
+          | \`rld-proctor-${TAG}-linux-x86_64.tar.gz\` | Linux (x86_64) | Standalone \`rld-proctor\` server binary |
+          | \`rld-proctor-${TAG}-linux-aarch64.tar.gz\` | Linux (ARM64) | Standalone \`rld-proctor\` server binary |
+          | \`SHA256SUMS.txt\` | All | SHA-256 checksums for all release artifacts |
+
+          Verify downloads with:
+
+          \`\`\`sh
+          shasum -a 256 -c SHA256SUMS.txt
+          \`\`\`
+          EOF
+
       - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          if [ -s release_notes.md ]; then
-            gh release create "$GITHUB_REF_NAME" \
-              "$APP_ZIP" \
-              "$PROCTOR_TAR" \
-              --title "RLD Browser $GITHUB_REF_NAME" \
-              --notes-file release_notes.md
-          else
-            gh release create "$GITHUB_REF_NAME" \
-              "$APP_ZIP" \
-              "$PROCTOR_TAR" \
-              --title "RLD Browser $GITHUB_REF_NAME" \
-              --generate-notes
-          fi
+          TAG="${GITHUB_REF_NAME}"
+          gh release create "$TAG" \
+            --title "RLD Browser $TAG" \
+            --notes-file release_notes.md \
+            release-artifacts/*

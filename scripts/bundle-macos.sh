@@ -1,6 +1,26 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+BUILD_DMG="${BUILD_DMG:-0}"
+
+for arg in "$@"; do
+  case "$arg" in
+    --dmg)
+      BUILD_DMG=1
+      ;;
+    -h|--help)
+      echo "Usage: $0 [--dmg]"
+      echo "  --dmg  Also build a drag-to-Applications macOS disk image (or set BUILD_DMG=1)"
+      exit 0
+      ;;
+    *)
+      echo "Unknown option: $arg" >&2
+      echo "Usage: $0 [--dmg]" >&2
+      exit 1
+      ;;
+  esac
+done
+
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 DIST_DIR="$ROOT_DIR/dist"
 APP_DIR="$DIST_DIR/RLD Browser.app"
@@ -34,3 +54,23 @@ else
 fi
 
 echo "Done: $APP_DIR"
+
+if [[ "$BUILD_DMG" == "1" ]]; then
+  DMG_PATH="$DIST_DIR/RLD-Browser-macos-arm64.dmg"
+  DMG_STAGE="$(mktemp -d)"
+  trap 'rm -rf "$DMG_STAGE"' EXIT
+
+  echo "Creating disk image $DMG_PATH..."
+  ditto "$APP_DIR" "$DMG_STAGE/RLD Browser.app"
+  ln -s /Applications "$DMG_STAGE/Applications"
+  rm -f "$DMG_PATH"
+  hdiutil create \
+    -volname "RLD Browser" \
+    -srcfolder "$DMG_STAGE" \
+    -ov \
+    -format UDZO \
+    "$DMG_PATH"
+  rm -rf "$DMG_STAGE"
+  trap - EXIT
+  echo "Done: $DMG_PATH"
+fi

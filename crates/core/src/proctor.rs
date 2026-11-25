@@ -10,6 +10,8 @@ use crate::browser::PinnedTab;
 pub struct ProctorPolicy {
     pub server_url: Option<Url>,
     pub room_code: Option<String>,
+    #[serde(default)]
+    pub join_token: Option<String>,
     pub heartbeat_interval_secs: u64,
     pub enable_webcam: bool,
 }
@@ -19,6 +21,7 @@ impl Default for ProctorPolicy {
         Self {
             server_url: None,
             room_code: None,
+            join_token: None,
             heartbeat_interval_secs: 5,
             enable_webcam: false,
         }
@@ -94,6 +97,8 @@ impl Default for RoomPolicyOverrides {
 pub struct StudentHeartbeat {
     pub student_id: String,
     pub room_code: Option<String>,
+    #[serde(default)]
+    pub join_token: Option<String>,
     pub exam_name: String,
     pub config_key: String,
     pub status: StudentStatus,

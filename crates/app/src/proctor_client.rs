@@ -17,21 +17,218 @@ pub struct TelemetryState {
     pub violations: Vec<String>,
 }
 
-/// Posts a single `StudentHeartbeat` over HTTP/1.1 to `server_url` (`/api/heartbeat`).
-/// Supports `http://` LAN classroom servers with zero external HTTP crate dependencies.
+#[cfg(target_os = "macos")]
+fn https_post(
+    url_str: &str,
+    content_type: &str,
+    room_code: Option<&str>,
+    join_token: Option<&str>,
+    body: &[u8],
+    timeout: Duration,
+) -> Result<(i64, Vec<u8>), String> {
+    use std::ffi::c_void;
+    use std::sync::mpsc;
+
+    use block2::RcBlock;
+    use objc2::rc::{Retained, autoreleasepool};
+    use objc2::runtime::AnyObject;
+    use objc2::{class, msg_send};
+    use objc2_foundation::NSString;
+
+    let (tx, rx) = mpsc::channel::<Result<(i64, Vec<u8>), String>>();
+    let tx_slot = Arc::new(Mutex::new(Some(tx)));
+
+    let task: Retained<AnyObject> = autoreleasepool(|_| -> Result<Retained<AnyObject>, String> {
+        let ns_url_str = NSString::from_str(url_str);
+        // SAFETY: `NSURL` is a standard Foundation class; `URLWithString:` accepts `&NSString`.
+        let ns_url: Option<Retained<AnyObject>> =
+            unsafe { msg_send![class!(NSURL), URLWithString: &*ns_url_str] };
+        let ns_url = ns_url.ok_or_else(|| format!("invalid HTTPS URL: {url_str}"))?;
+
+        let timeout_secs: f64 = timeout.as_secs_f64().max(0.1);
+        // cachePolicy = 1 (`NSURLRequestReloadIgnoringLocalCacheData`).
+        // SAFETY: `NSMutableURLRequest` accepts valid `NSURL`, `NSUInteger`, and `NSTimeInterval`.
+        let req: Retained<AnyObject> = unsafe {
+            msg_send![
+                class!(NSMutableURLRequest),
+                requestWithURL: &*ns_url,
+                cachePolicy: 1usize,
+                timeoutInterval: timeout_secs
+            ]
+        };
+
+        let method = NSString::from_str("POST");
+        let ct_val = NSString::from_str(content_type);
+        let ct_key = NSString::from_str("Content-Type");
+        // SAFETY: `req` is a valid `NSMutableURLRequest` and all string args are valid `NSString`.
+        unsafe {
+            let (): () = msg_send![&*req, setHTTPMethod: &*method];
+            let (): () = msg_send![&*req, setValue: &*ct_val, forHTTPHeaderField: &*ct_key];
+        }
+
+        if let Some(code) = room_code {
+            let clean = code.replace(['\r', '\n'], "");
+            let val = NSString::from_str(&clean);
+            let key = NSString::from_str("X-Room-Code");
+            // SAFETY: `req` is a valid `NSMutableURLRequest` and args are valid `NSString`.
+            unsafe {
+                let (): () = msg_send![&*req, setValue: &*val, forHTTPHeaderField: &*key];
+            }
+        }
+        if let Some(token) = join_token {
+            let clean = token.replace(['\r', '\n'], "");
+            let val = NSString::from_str(&clean);
+            let key = NSString::from_str("X-Room-Token");
+            // SAFETY: `req` is a valid `NSMutableURLRequest` and args are valid `NSString`.
+            unsafe {
+                let (): () = msg_send![&*req, setValue: &*val, forHTTPHeaderField: &*key];
+            }
+        }
+
+        if !body.is_empty() {
+            // SAFETY: `dataWithBytes:length:` copies `body.len()` bytes from `body.as_ptr()`.
+            let ns_data: Retained<AnyObject> = unsafe {
+                msg_send![
+                    class!(NSData),
+                    dataWithBytes: body.as_ptr().cast::<c_void>(),
+                    length: body.len()
+                ]
+            };
+            // SAFETY: `req` is a valid `NSMutableURLRequest` and `ns_data` is a valid `NSData`.
+            unsafe {
+                let (): () = msg_send![&*req, setHTTPBody: &*ns_data];
+            }
+        }
+
+        let tx_for_block = Arc::clone(&tx_slot);
+        let block = RcBlock::new(
+            move |data: *mut AnyObject, response: *mut AnyObject, error: *mut AnyObject| {
+                let outcome = if !error.is_null() {
+                    // SAFETY: `error` is a non-null `NSError*` provided by `NSURLSession`.
+                    let desc: Option<Retained<NSString>> =
+                        unsafe { msg_send![error, localizedDescription] };
+                    Err(desc
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| "NSURLSession request failed".to_string()))
+                } else {
+                    let status: i64 = if !response.is_null() {
+                        // SAFETY: `response` is a non-null `NSURLResponse*`.
+                        let is_http: bool = unsafe {
+                            msg_send![response, isKindOfClass: class!(NSHTTPURLResponse)]
+                        };
+                        if is_http {
+                            // SAFETY: Verified `NSHTTPURLResponse` responds to `statusCode`.
+                            let code: isize = unsafe { msg_send![response, statusCode] };
+                            code as i64
+                        } else {
+                            0
+                        }
+                    } else {
+                        0
+                    };
+                    let resp_bytes = if !data.is_null() {
+                        // SAFETY: `data` is a non-null `NSData*`.
+                        let len: usize = unsafe { msg_send![data, length] };
+                        if len > 0 {
+                            let ptr: *const u8 = unsafe { msg_send![data, bytes] };
+                            if !ptr.is_null() {
+                                // SAFETY: `NSData` guarantees `ptr` is valid for `len` bytes during callback.
+                                unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec()
+                            } else {
+                                Vec::new()
+                            }
+                        } else {
+                            Vec::new()
+                        }
+                    } else {
+                        Vec::new()
+                    };
+                    Ok((status, resp_bytes))
+                };
+                if let Ok(mut guard) = tx_for_block.lock()
+                    && let Some(sender) = guard.take()
+                {
+                    let _ = sender.send(outcome);
+                }
+            },
+        );
+
+        // SAFETY: `NSURLSession.sharedSession` is thread-safe and returns a live `NSURLSession`.
+        let session: Retained<AnyObject> =
+            unsafe { msg_send![class!(NSURLSession), sharedSession] };
+        // SAFETY: `dataTaskWithRequest:completionHandler:` retains the block and returns a task.
+        let task: Retained<AnyObject> = unsafe {
+            msg_send![
+                &*session,
+                dataTaskWithRequest: &*req,
+                completionHandler: &*block
+            ]
+        };
+        // SAFETY: `task` is a valid `NSURLSessionDataTask`.
+        unsafe {
+            let (): () = msg_send![&*task, resume];
+        }
+        Ok(task)
+    })?;
+
+    match rx.recv_timeout(timeout + Duration::from_secs(1)) {
+        Ok(res) => res,
+        Err(_) => {
+            // SAFETY: `task` is a live `NSURLSessionDataTask`; `cancel` is thread-safe.
+            unsafe {
+                let (): () = msg_send![&*task, cancel];
+            }
+            Err("HTTPS request to proctor server timed out".to_string())
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn https_post(
+    _url_str: &str,
+    _content_type: &str,
+    _room_code: Option<&str>,
+    _join_token: Option<&str>,
+    _body: &[u8],
+    _timeout: Duration,
+) -> Result<(i64, Vec<u8>), String> {
+    Err("https:// proctor transport requires macOS NSURLSession".to_string())
+}
+
+/// Posts a single `StudentHeartbeat` over HTTP/1.1 or native macOS HTTPS to `server_url` (`/api/heartbeat`).
 pub fn post_heartbeat(server_url: &Url, hb: &StudentHeartbeat) -> Result<HeartbeatResponse, String> {
     post_heartbeat_with_timeout(server_url, hb, Duration::from_secs(3))
 }
 
-/// Posts a single `StudentHeartbeat` over HTTP/1.1 with an explicit connect/read/write timeout.
+/// Posts a single `StudentHeartbeat` with an explicit connect/read/write timeout.
 pub fn post_heartbeat_with_timeout(
     server_url: &Url,
     hb: &StudentHeartbeat,
     timeout: Duration,
 ) -> Result<HeartbeatResponse, String> {
+    let body = serde_json::to_vec(hb).map_err(|e| e.to_string())?;
+
+    if server_url.scheme() == "https" {
+        let endpoint = server_url
+            .join("/api/heartbeat")
+            .map_err(|e| e.to_string())?;
+        let (status, resp_bytes) = https_post(
+            endpoint.as_str(),
+            "application/json",
+            hb.room_code.as_deref(),
+            hb.join_token.as_deref(),
+            &body,
+            timeout,
+        )?;
+        if !(200..300).contains(&status) {
+            return Err(format!("proctor server returned HTTP {status}"));
+        }
+        return serde_json::from_slice::<HeartbeatResponse>(&resp_bytes).map_err(|e| e.to_string());
+    }
+
     if server_url.scheme() != "http" {
         return Err(format!(
-            "unsupported proctor server scheme '{}' (v2 LAN client supports http://)",
+            "unsupported proctor server scheme '{}' (supported: http://, https://)",
             server_url.scheme()
         ));
     }
@@ -41,7 +238,6 @@ pub fn post_heartbeat_with_timeout(
     let port = server_url.port().unwrap_or(80);
     let addr = format!("{host}:{port}");
 
-    let body = serde_json::to_vec(hb).map_err(|e| e.to_string())?;
     let sock_addr = addr
         .to_socket_addrs()
         .map_err(|e| e.to_string())?
@@ -51,10 +247,20 @@ pub fn post_heartbeat_with_timeout(
     let _ = stream.set_read_timeout(Some(timeout));
     let _ = stream.set_write_timeout(Some(timeout));
 
-    let req = format!(
-        "POST /api/heartbeat HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+    let mut req = format!(
+        "POST /api/heartbeat HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n",
         body.len()
     );
+    if let Some(code) = hb.room_code.as_deref() {
+        let clean = code.replace(['\r', '\n'], "");
+        let _ = write!(req, "X-Room-Code: {clean}\r\n");
+    }
+    if let Some(token) = hb.join_token.as_deref() {
+        let clean = token.replace(['\r', '\n'], "");
+        let _ = write!(req, "X-Room-Token: {clean}\r\n");
+    }
+    req.push_str("\r\n");
+
     stream
         .write_all(req.as_bytes())
         .map_err(|e| e.to_string())?;
@@ -170,10 +376,13 @@ fn read_http_response(stream: &mut TcpStream) -> std::io::Result<bool> {
     Ok(!connection_close)
 }
 
-/// Persistent HTTP/1.1 keep-alive raw-JPEG uploader for high-FPS webcam and screen streaming.
+/// Persistent HTTP/1.1 keep-alive (or native macOS HTTPS) raw-JPEG uploader for high-FPS webcam and screen streaming.
 pub struct WebcamUploader {
     addr: Option<String>,
+    https_url: Option<String>,
     path: String,
+    pub room_code: Option<String>,
+    pub join_token: Option<String>,
     stream: Option<TcpStream>,
 }
 
@@ -183,20 +392,33 @@ impl WebcamUploader {
     }
 
     pub fn with_endpoint(server_url: Url, student_id: String, endpoint_prefix: &str) -> Self {
-        let addr = if server_url.scheme() == "http" {
-            server_url
-                .host_str()
-                .map(|host| format!("{host}:{}", server_url.port().unwrap_or(80)))
-        } else {
-            None
-        };
         let encoded_id = percent_encode_path_segment(&student_id);
         let prefix = endpoint_prefix.trim_end_matches('/');
+        let path = format!("{prefix}/{encoded_id}");
+        let (addr, https_url) = match server_url.scheme() {
+            "http" => (
+                server_url
+                    .host_str()
+                    .map(|host| format!("{host}:{}", server_url.port().unwrap_or(80))),
+                None,
+            ),
+            "https" => (None, server_url.join(&path).ok().map(|u| u.to_string())),
+            _ => (None, None),
+        };
         Self {
             addr,
-            path: format!("{prefix}/{encoded_id}"),
+            https_url,
+            path,
+            room_code: None,
+            join_token: None,
             stream: None,
         }
+    }
+
+    pub fn with_room(mut self, room_code: Option<String>, join_token: Option<String>) -> Self {
+        self.room_code = room_code;
+        self.join_token = join_token;
+        self
     }
 
     fn connect(addr: &str) -> Option<TcpStream> {
@@ -209,12 +431,27 @@ impl WebcamUploader {
         Some(stream)
     }
 
-    /// Uploads raw JPEG bytes over the persistent keep-alive socket.
+    /// Uploads raw JPEG bytes over the persistent keep-alive socket (for `http://`)
+    /// or native macOS `NSURLSession` (for `https://`).
     /// Drops the socket on any write/read failure so the next frame reconnects cleanly.
     pub fn send_raw_jpeg(&mut self, jpeg: &[u8]) -> bool {
         if jpeg.is_empty() {
             return false;
         }
+        if let Some(url) = self.https_url.as_deref() {
+            return matches!(
+                https_post(
+                    url,
+                    "image/jpeg",
+                    self.room_code.as_deref(),
+                    self.join_token.as_deref(),
+                    jpeg,
+                    Duration::from_secs(2),
+                ),
+                Ok((status, _)) if (200..300).contains(&status)
+            );
+        }
+
         let Some(addr) = self.addr.as_deref() else {
             return false;
         };
@@ -226,11 +463,21 @@ impl WebcamUploader {
             return false;
         };
 
-        let header = format!(
-            "POST {} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: image/jpeg\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n",
+        let mut header = format!(
+            "POST {} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: image/jpeg\r\nContent-Length: {}\r\nConnection: keep-alive\r\n",
             self.path,
             jpeg.len()
         );
+        if let Some(code) = self.room_code.as_deref() {
+            let clean = code.replace(['\r', '\n'], "");
+            let _ = write!(header, "X-Room-Code: {clean}\r\n");
+        }
+        if let Some(token) = self.join_token.as_deref() {
+            let clean = token.replace(['\r', '\n'], "");
+            let _ = write!(header, "X-Room-Token: {clean}\r\n");
+        }
+        header.push_str("\r\n");
+
         let io_result = stream
             .write_all(header.as_bytes())
             .and_then(|()| stream.write_all(jpeg))
@@ -264,6 +511,7 @@ impl WebcamUploader {
 pub struct HeartbeatConfig {
     pub server_url: Url,
     pub room_code: Option<String>,
+    pub join_token: Option<String>,
     pub student_id: String,
     pub exam_name: String,
     pub config_key: String,
@@ -289,6 +537,7 @@ pub fn spawn_heartbeat_thread<F, P>(
             let hb = StudentHeartbeat {
                 student_id: cfg.student_id.clone(),
                 room_code: cfg.room_code.clone(),
+                join_token: cfg.join_token.clone(),
                 exam_name: cfg.exam_name.clone(),
                 config_key: cfg.config_key.clone(),
                 status: snap.status,
@@ -482,5 +731,126 @@ mod tests {
         assert_eq!(received.len(), 2);
         assert_eq!(received[0], frame1);
         assert_eq!(received[1], frame2);
+    }
+
+    #[test]
+    fn webcam_uploader_sends_room_code_and_join_token_headers() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = std::thread::spawn(move || {
+            use std::io::BufRead;
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = std::io::BufReader::new(&mut stream);
+            let mut headers = String::new();
+            let mut content_len = 0usize;
+            loop {
+                let mut line = String::new();
+                let n = reader.read_line(&mut line).unwrap();
+                assert!(n > 0);
+                if line == "\r\n" || line == "\n" {
+                    break;
+                }
+                if let Some((k, v)) = line.split_once(':')
+                    && k.trim().eq_ignore_ascii_case("content-length")
+                {
+                    content_len = v.trim().parse().unwrap_or(0);
+                }
+                headers.push_str(&line);
+            }
+            let mut body = vec![0u8; content_len];
+            reader.read_exact(&mut body).unwrap();
+            drop(reader);
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok",
+                )
+                .unwrap();
+            stream.flush().unwrap();
+            (headers, body)
+        });
+
+        let url = Url::parse(&format!("http://{addr}")).unwrap();
+        let mut uploader = WebcamUploader::new(url, "alice".to_string()).with_room(
+            Some("AP-BIO-101".to_string()),
+            Some("tok-secret-999".to_string()),
+        );
+        let frame = vec![0xFF, 0xD8, 0xFF, 0xD9];
+        assert!(uploader.send_raw_jpeg(&frame));
+
+        let (headers, body) = server.join().unwrap();
+        assert!(headers.starts_with("POST /api/webcam-raw/alice HTTP/1.1\r\n"));
+        assert!(headers.contains("X-Room-Code: AP-BIO-101\r\n"));
+        assert!(headers.contains("X-Room-Token: tok-secret-999\r\n"));
+        assert_eq!(body, frame);
+    }
+
+    #[test]
+    fn post_heartbeat_sends_room_code_and_join_token_headers_and_body() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = std::thread::spawn(move || {
+            use std::io::BufRead;
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = std::io::BufReader::new(&mut stream);
+            let mut headers = String::new();
+            let mut content_len = 0usize;
+            loop {
+                let mut line = String::new();
+                let n = reader.read_line(&mut line).unwrap();
+                assert!(n > 0);
+                if line == "\r\n" || line == "\n" {
+                    break;
+                }
+                if let Some((k, v)) = line.split_once(':')
+                    && k.trim().eq_ignore_ascii_case("content-length")
+                {
+                    content_len = v.trim().parse().unwrap_or(0);
+                }
+                headers.push_str(&line);
+            }
+            let mut body = vec![0u8; content_len];
+            reader.read_exact(&mut body).unwrap();
+            drop(reader);
+
+            let resp = HeartbeatResponse {
+                command: ProctorCommand::None,
+                config_key_verified: true,
+                policy: RoomPolicyOverrides::default(),
+            };
+            let resp_json = serde_json::to_string(&resp).unwrap();
+            let http_resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                resp_json.len(),
+                resp_json
+            );
+            stream.write_all(http_resp.as_bytes()).unwrap();
+            stream.flush().unwrap();
+            (headers, body)
+        });
+
+        let url = Url::parse(&format!("http://{addr}")).unwrap();
+        let hb = StudentHeartbeat {
+            student_id: "alice".to_string(),
+            room_code: Some("CS-202".to_string()),
+            join_token: Some("join-tok-abc".to_string()),
+            exam_name: "Midterm".to_string(),
+            config_key: "deadbeef".to_string(),
+            status: StudentStatus::InExam,
+            active_host: "exam.example.edu".to_string(),
+            violations: Vec::new(),
+        };
+        let resp = post_heartbeat_with_timeout(&url, &hb, Duration::from_secs(2)).unwrap();
+        assert!(resp.config_key_verified);
+        assert_eq!(resp.command, ProctorCommand::None);
+
+        let (headers, body) = server.join().unwrap();
+        assert!(headers.starts_with("POST /api/heartbeat HTTP/1.1\r\n"));
+        assert!(headers.contains("X-Room-Code: CS-202\r\n"));
+        assert!(headers.contains("X-Room-Token: join-tok-abc\r\n"));
+        let decoded: StudentHeartbeat = serde_json::from_slice(&body).unwrap();
+        assert_eq!(decoded.room_code.as_deref(), Some("CS-202"));
+        assert_eq!(decoded.join_token.as_deref(), Some("join-tok-abc"));
     }
 }

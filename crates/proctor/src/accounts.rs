@@ -55,6 +55,8 @@ pub struct RoomSummary {
     pub name: String,
     pub owner_id: String,
     pub created_at_epoch: u64,
+    #[serde(default)]
+    pub join_token: String,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -79,6 +81,7 @@ impl AccountStore {
     pub fn new(storage_path: Option<PathBuf>) -> Self {
         let mut accounts = BTreeMap::new();
         let mut rooms = BTreeMap::new();
+        let mut backfilled = false;
 
         if let Some(ref path) = storage_path
             && let Ok(raw) = fs::read_to_string(path)
@@ -92,16 +95,24 @@ impl AccountStore {
             for (_, mut room) in persisted.rooms {
                 let key = room.code.trim().to_ascii_uppercase();
                 room.code = key.clone();
+                if room.join_token.trim().is_empty() {
+                    room.join_token = generate_hex_token_128();
+                    backfilled = true;
+                }
                 rooms.insert(key, room);
             }
         }
 
-        Self {
+        let store = Self {
             accounts,
             sessions: BTreeMap::new(),
             rooms,
             storage_path,
+        };
+        if backfilled {
+            let _ = store.save();
         }
+        store
     }
 
     pub fn register(
@@ -209,6 +220,7 @@ impl AccountStore {
             name: trimmed_name.to_string(),
             owner_id: trimmed_owner.to_string(),
             created_at_epoch: current_epoch_secs(),
+            join_token: generate_hex_token_128(),
         };
 
         self.rooms.insert(code.clone(), summary.clone());
@@ -238,6 +250,25 @@ impl AccountStore {
     pub fn get_room(&self, code: &str) -> Option<&RoomSummary> {
         let normalized = code.trim().to_ascii_uppercase();
         self.rooms.get(&normalized)
+    }
+
+    pub fn verify_join_token(&self, room_code: &str, token: &str) -> bool {
+        let trimmed = token.trim();
+        if trimmed.is_empty() {
+            return false;
+        }
+        let Some(room) = self.get_room(room_code) else {
+            return false;
+        };
+        if room.join_token.is_empty() {
+            return false;
+        }
+        constant_time_eq(room.join_token.as_bytes(), trimmed.as_bytes())
+    }
+
+    pub fn is_room_owner(&self, owner_id: &str, room_code: &str) -> bool {
+        self.get_room(room_code)
+            .is_some_and(|room| room.owner_id == owner_id)
     }
 
     pub fn delete_room(&mut self, owner_id: &str, code: &str) -> bool {
@@ -389,6 +420,17 @@ fn encode_hex(bytes: &[u8]) -> String {
         let _ = write!(&mut hex, "{b:02x}");
     }
     hex
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (&x, &y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 fn generate_hex_token_128() -> String {
@@ -581,6 +623,74 @@ mod tests {
         assert!(reloaded.delete_room(&teacher.id, "COMP-101"));
         let reloaded_after_delete = AccountStore::new(Some(path.clone()));
         assert!(reloaded_after_delete.get_room("COMP-101").is_none());
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn join_token_generation_verification_ownership_and_backfill() {
+        let path = unique_temp_path("join_token_backfill");
+        let _ = fs::remove_file(&path);
+
+        // Write legacy persisted JSON without join_token on a room.
+        let legacy_json = r#"{
+  "accounts": {
+    "a@school.edu": {
+      "id": "tchr_1111111111111111",
+      "email": "a@school.edu",
+      "name": "Teacher A",
+      "password_hash": "hash"
+    }
+  },
+  "rooms": {
+    "LEGACY-1": {
+      "code": "LEGACY-1",
+      "name": "Legacy Room",
+      "owner_id": "tchr_1111111111111111",
+      "created_at_epoch": 1700000000
+    }
+  }
+}"#;
+        fs::write(&path, legacy_json).expect("write legacy json");
+
+        let mut store = AccountStore::new(Some(path.clone()));
+        let legacy_room = store.get_room("legacy-1").expect("legacy room loaded").clone();
+        assert_eq!(legacy_room.join_token.len(), 32);
+        assert!(
+            legacy_room
+                .join_token
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+        );
+
+        // Verify backfill was persisted to disk and stays stable on reload.
+        let reloaded = AccountStore::new(Some(path.clone()));
+        let persisted_room = reloaded.get_room("LEGACY-1").expect("persisted room");
+        assert_eq!(persisted_room.join_token, legacy_room.join_token);
+
+        // verify_join_token & is_room_owner checks.
+        assert!(store.verify_join_token("legacy-1", &legacy_room.join_token));
+        assert!(!store.verify_join_token("legacy-1", "wrong-token"));
+        assert!(!store.verify_join_token("legacy-1", ""));
+        assert!(!store.verify_join_token("MISSING", &legacy_room.join_token));
+
+        assert!(store.is_room_owner("tchr_1111111111111111", "legacy-1"));
+        assert!(!store.is_room_owner("tchr_2222222222222222", "LEGACY-1"));
+        assert!(!store.is_room_owner("tchr_1111111111111111", "MISSING"));
+
+        // Newly created room also receives a 32-char lowercase hex join token.
+        let fresh = store
+            .create_room("tchr_1111111111111111", "Fresh Room", Some("FRESH-1"))
+            .expect("create fresh room");
+        assert_eq!(fresh.join_token.len(), 32);
+        assert!(
+            fresh
+                .join_token
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+        );
+        assert_ne!(fresh.join_token, legacy_room.join_token);
+        assert!(store.verify_join_token("fresh-1", &fresh.join_token));
 
         let _ = fs::remove_file(&path);
     }
