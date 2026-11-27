@@ -10,7 +10,7 @@ Lightweight, native Rust exam lockdown browser for macOS — with built-in acces
 ![Binary Size](https://img.shields.io/badge/binary%20size-~3%20MB-2ea44f?style=flat-square)
 [![Downloads](https://img.shields.io/github/downloads/elevatesoft/rldbrowser/total?style=flat-square)](https://github.com/elevatesoft/rldbrowser/releases)
 
-[Features](#features) · [Installation](#installation) · [Quick Start](#quick-start) · [Proctor Console](#live-proctor-console) · [Security & Privacy](#security--privacy) · [Cloud Deployment](#cloud-deployment) · [Building](#building-from-source)
+[Features](#features) · [Installation](#installation) · [Quick Start](#quick-start) · [Proctor Console](#live-proctor-console) · [Security & Privacy](#security--privacy) · [Building](#building-from-source)
 
 </div>
 
@@ -53,8 +53,8 @@ Lightweight, native Rust exam lockdown browser for macOS — with built-in acces
 
 Download the latest release from [GitHub Releases](https://github.com/elevatesoft/rldbrowser/releases/latest):
 
-- **macOS App**: `RLD-Browser-<version>-aarch64.dmg` (drag **RLD Browser.app** into `/Applications`) or `RLD-Browser-<version>-aarch64.zip`.
-- **Proctor Server (`rld-proctor`)**: Prebuilt standalone binaries for macOS ARM64 (`aarch64-apple-darwin`), Linux ARM64 (`aarch64-unknown-linux-gnu`), and Linux x86_64 (`x86_64-unknown-linux-gnu`).
+- **macOS App**: `RLD-Browser-<version>-macos-arm64.dmg` (drag **RLD Browser.app** into `/Applications`) or `RLD-Browser-<version>-macos-arm64.zip`.
+- **Proctor Server (`rld-proctor`)**: Prebuilt standalone binaries for macOS ARM64 (`macos-arm64`), Linux ARM64 (`linux-aarch64`), and Linux x86_64 (`linux-x86_64`).
 - **Checksums**: Every release includes `SHA256SUMS.txt` for verifying downloads (`shasum -a 256 -c SHA256SUMS.txt`).
 
 > **Note on ad-hoc signed builds**
@@ -94,10 +94,6 @@ Download the latest release from [GitHub Releases](https://github.com/elevatesof
 - **Multi-Tenant Teacher Isolation**: Rooms are scoped to their owning teacher account; cross-teacher room reads, stream access, and policy mutations return `403 Forbidden`.
 - **Native macOS TLS 1.3**: Student-to-proctor `https://` transport uses Apple's native `NSURLSession` stack with TLS 1.3, HTTP/2 connection pooling, and system Keychain root CA trust.
 - **Auth Hardening**: Per-IP sliding-window rate limiting (`429 Too Many Requests`) on `/api/auth/login` and `/api/auth/register`, salted password hashes, `HttpOnly` session cookies with automatic `; Secure` flag behind `X-Forwarded-Proto: https`, and a 128-bit secret path token on the local HUD loopback server.
-
-## Cloud Deployment
-
-To host `rld-proctor` over HTTPS for remote or school-wide classrooms at zero monthly cost, see the [Oracle Cloud Always Free deployment guide](deploy/oracle-cloud/README.md) (ARM64 Ampere instance + `systemd` unit + Caddy automatic HTTPS).
 
 ## Building from Source
 

@@ -10,7 +10,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - Native macOS `https://` proctor client transport via `NSURLSession` (TLS 1.3 + HTTP/2 connection pooling + system Keychain root CA trust).
 - Per-room 128-bit student join tokens (`--require-join-token`, `X-Room-Code` & `X-Room-Token` headers) and multi-tenant teacher room isolation (`403 Forbidden` across teachers).
-- Production Oracle Cloud Always Free deployment configs (`deploy/oracle-cloud/Caddyfile`, `rld-proctor.service`, and setup guide).
 - Full GitHub Release packaging: macOS `.dmg` drag-to-Applications installer, `.zip` bundle, prebuilt `rld-proctor` binaries for macOS ARM64 and Linux ARM64/x86_64, and `SHA256SUMS.txt`.
 
 ### Security
